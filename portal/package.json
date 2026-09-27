@@ -1,0 +1,9 @@
+{
+  "name": "mazel-portal",
+  "private": true,
+  "version": "0.4.0",
+  "description": "Mazel portal Worker (single file, no runtime deps) plus its test suites",
+  "type": "module",
+  "scripts": { "test": "test/run.sh" },
+  "devDependencies": { "@a2a-js/sdk": "1.2.1" }
+}
