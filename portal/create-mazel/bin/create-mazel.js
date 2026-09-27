@@ -19,7 +19,20 @@ import { spawn } from "node:child_process";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(HERE, "..", "worker", "index.js");
-const API = env.MAZEL_API_BASE || "https://api.cloudflare.com/client/v4";
+// The endpoint overrides exist for the suite, which stands up a fake Cloudflare on 127.0.0.1.
+// They are pinned to the loopback: every cf() call carries a live Cloudflare token, and without
+// this pin anything that could set one environment variable could redirect that token to a host
+// of its choosing.
+const loopbackOnly = (v, fallback) => {
+  if (!v) return fallback;
+  try {
+    const h = new URL(v).hostname;
+    if (h === "127.0.0.1" || h === "localhost" || h === "::1") return v;
+  } catch { /* fall through */ }
+  stdout.write(`  Ignoring ${v}: test endpoints must be on this machine.\n`);
+  return fallback;
+};
+const API = loopbackOnly(env.MAZEL_API_BASE, "https://api.cloudflare.com/client/v4");
 const flag = (n) => argv.includes(`--${n}`);
 const opt = (n, d) => { const i = argv.indexOf(`--${n}`); return i > -1 && argv[i + 1] ? argv[i + 1] : d; };
 const YES = flag("yes"), DRY = flag("dry-run"), ROTATE = flag("rotate-key");
@@ -65,8 +78,8 @@ async function cf(token, path, init = {}) {
 // the whole sign-in for real; nothing but the tests ever sets them.
 const OAUTH = {
   client: "54d11594-84e4-41aa-b438-e81b8fa78ee7",
-  auth: env.MAZEL_OAUTH_AUTH || "https://dash.cloudflare.com/oauth2/auth",
-  token: env.MAZEL_OAUTH_TOKEN || "https://dash.cloudflare.com/oauth2/token",
+  auth: loopbackOnly(env.MAZEL_OAUTH_AUTH, "https://dash.cloudflare.com/oauth2/auth"),
+  token: loopbackOnly(env.MAZEL_OAUTH_TOKEN, "https://dash.cloudflare.com/oauth2/token"),
   port: Number(env.MAZEL_OAUTH_PORT || 8976),
   scopes: ["account:read", "user:read", "workers:write", "workers_kv:write", "workers_scripts:write", "workers_routes:write", "offline_access"],
 };

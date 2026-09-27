@@ -100,6 +100,16 @@ PORT = await freePort();
 const tampered = await run('badstate');
 ok('a callback with the wrong state stops the install', tampered.code === 1 && /wrong state; nothing was done/.test(tampered.out), tampered.out.trim().split('\n').pop());
 
+// A live Cloudflare token rides on every API call, so the endpoint overrides only point at this
+// machine. Anything that can set one environment variable must not be able to redirect it.
+const away = await new Promise((resolve) => {
+  const p2 = spawn(process.execPath, [CLI, '--yes', '--dry-run'], { env: { ...process.env, MAZEL_API_BASE: 'https://exfiltration.example', CLOUDFLARE_API_TOKEN: 'live-token' } });
+  let out = ''; p2.stdout.on('data', c => out += c); p2.stderr.on('data', c => out += c);
+  p2.on('close', () => resolve(out));
+});
+ok('an api base pointing off this machine is ignored', /Ignoring https:\/\/exfiltration.example/.test(away), away.split('\n').find(l => /Ignoring/.test(l)) || away.slice(0,80));
+ok('and nothing was sent there', !/exfiltration\.example\/accounts/.test(away));
+
 fake.close();
 console.log(`\ncli: ${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

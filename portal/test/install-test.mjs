@@ -48,8 +48,12 @@ ok('the card is live with both haves and the need', haah.handle==='lea@mazel' &&
 page = await (await get(fresh, '/')).text();
 ok('/ is the public card page once claimed', /lea@mazel has a Mazel portal here/.test(page), page.split('\n')[0]);
 ok('/ never shows the token again', !page.includes(token) && !/mcp\?token/.test(page));
-ok('the handle cannot be changed after the claim', /fixed once it is claimed/.test(await mcp(fresh, 'update_card', { handle:'someone@mazel', confirmed:true }, token)));
-ok('my_card is a card again', JSON.parse(await mcp(fresh, 'my_card', {}, token)).handle === 'lea@mazel');
+// The setup key dies at the claim and the claim hands over the real one.
+const freshReal = (claimed.match(/mcp\?token=([a-f0-9]+)/) || [])[1];
+ok('the claim hands over the real connector link', !!freshReal && freshReal !== token);
+ok('the setup key stops working at the claim', /unauthor/i.test(await mcp(fresh, 'my_card', {}, token)));
+ok('the handle cannot be changed after the claim', /fixed once it is claimed/.test(await mcp(fresh, 'update_card', { handle:'someone@mazel', confirmed:true }, freshReal)));
+ok('my_card is a card again', JSON.parse(await mcp(fresh, 'my_card', {}, freshReal)).handle === 'lea@mazel');
 
 // 5. A portal installed before the claim existed is already someone's: never a setup link.
 const old = { HANDLE:'ariel@mazel', PERSONA:'p', NEED:'', HAVE:'managed-ai-delivery', INBOX_TOKEN:'ta', MAILBOX: mkKV(), RELAY_URL:'https://relay.test' };
@@ -84,6 +88,7 @@ ok('and says plainly that name@mazel cannot be resolved without one', /has no re
 const gpt = { HANDLE:'you@mazel', PERSONA:'', NEED:'', HAVE:'', MAILBOX: mkKV(), RELAY_URL:'https://relay.test', PORTAL_ORIGIN: O };
 await get(gpt, '/');
 const gptToken = (await (await get(gpt, '/')).text()).match(/token=([a-f0-9]+)/)[1];
+await get(gpt, '/card');   // the signing key is minted lazily; mint it before measuring writes
 const kvBefore = gpt.MAILBOX.m.size;
 const linkOut = await mcp(gpt, 'claim_link', { handle:'lea@mazel', persona:'Lea builds biotech teams.', have:['biotech-recruiting','lab-ops'], need:'seed-investors', held_need:'quiet-cofounder-search' }, gptToken);
 const claimUrl = (linkOut.match(/https:\/\/\S+\/claim\?\S+/) || [])[0];
@@ -109,7 +114,13 @@ const gptHaah = gptCard.capabilities.extensions.find(e => /haah/.test(e.uri)).pa
 ok('the card it wrote is the card the agent drafted', gptHaah.handle === 'lea@mazel' && gptHaah.have.includes('lab-ops') && gptHaah.need.includes('seed-investors'));
 ok('a held need never reaches the public card', !JSON.stringify(gptHaah).includes('quiet-cofounder-search'), JSON.stringify(gptHaah.need));
 ok('the setup link stops once the portal is claimed this way', !/mcp\?token=[a-f0-9]{16,}/.test(await (await get(gpt, '/')).text()));
-ok('claim_link refuses once there is an owner', /already belongs to/.test(await mcp(gpt, 'claim_link', { handle:'someone@mazel' }, gptToken)));
+// The key the welcome page showed is a setup key and dies at the claim; the page hands over the
+// real one, which is a different string.
+const realToken = (page.match(/mcp\?token=([a-f0-9]+)/) || [])[1];
+ok('the claim hands over the real connector link, and it is not the setup key', !!realToken && realToken !== gptToken);
+ok('the setup key stops working the moment the portal is claimed', /unauthor/i.test(await mcp(gpt, 'my_card', {}, gptToken)));
+ok('the real key works', JSON.parse(await mcp(gpt, 'my_card', {}, realToken)).handle === 'lea@mazel');
+ok('claim_link refuses once there is an owner', /already belongs to/.test(await mcp(gpt, 'claim_link', { handle:'someone@mazel' }, realToken)));
 
 // A link nobody could have minted, and one that has aged out, are both refused.
 const other = { HANDLE:'you@mazel', PERSONA:'', NEED:'', HAVE:'', MAILBOX: mkKV(), RELAY_URL:'https://relay.test', PORTAL_ORIGIN: O };
@@ -126,7 +137,7 @@ globalThis.fetch = async (u, i = {}) => {
   return netlessFetch(u, i);
 };
 gpt.MAILBOX.m.set('intro:i1', JSON.stringify({ intro_id:'i1', direction:'received', state:'proposed', why:'You have lab-ops; sam@mazel needs it.', path:['sam@mazel'], from:{ handle:'sam@mazel', rpc:'https://peer.test/a2a' }, created:new Date().toISOString() }));
-const introOut = await mcp(gpt, 'respond_intro_link', { intro_id:'i1', decision:'accepted', note:'Tuesdays work.' }, gptToken);
+const introOut = await mcp(gpt, 'respond_intro_link', { intro_id:'i1', decision:'accepted', note:'Tuesdays work.' }, realToken);
 const introUrl = (introOut.match(/https:\/\/\S+\/intro\?\S+/) || [])[0];
 ok('respond_intro_link hands back a link for the answer', !!introUrl, introOut.split('\n')[0]);
 page = await (await worker.fetch(new Request(introUrl), gpt)).text();
@@ -140,7 +151,7 @@ ok('answering twice is refused', /already/i.test(await (await worker.fetch(new R
 globalThis.fetch = netlessFetch;
 
 // 7. The quiet rule rides on the tools that can produce something to say.
-const tools = (await (await worker.fetch(new Request(`${O}/mcp?token=${token}`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list' }) }), fresh)).json()).result.tools;
+const tools = (await (await worker.fetch(new Request(`${O}/mcp?token=${freshReal}`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list' }) }), fresh)).json()).result.tools;
 const byName = Object.fromEntries(tools.map(t => [t.name, t.description]));
 ok('the quiet rule is on the tools that can speak', ['my_card','check_mailbox','pulse','find'].every(n => /three moments only/.test(byName[n])));
 ok('and not on the ones that cannot', !/three moments only/.test(byName['close_thread']));
