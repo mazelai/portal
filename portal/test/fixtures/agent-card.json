@@ -1,0 +1,69 @@
+{
+  "name": "ariel@mazel",
+  "description": "Ariel runs Paragon.",
+  "supportedInterfaces": [
+    {
+      "url": "https://mazel.fixture.workers.dev/a2a",
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0",
+      "tenant": ""
+    }
+  ],
+  "provider": {
+    "organization": "Mazel",
+    "url": "https://mazel.ai"
+  },
+  "version": "0.4.0",
+  "documentationUrl": "https://mazel.ai",
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": true,
+    "extensions": [
+      {
+        "uri": "https://mazel.ai/ext/haah/v1",
+        "description": "Mazel HAAH: a handle, Need and Have tags with one-line glosses, and the find / intro actions carried in message metadata. See https://mazel.ai",
+        "required": false,
+        "params": {
+          "handle": "ariel@mazel",
+          "cardUrl": "https://mazel.fixture.workers.dev/card",
+          "need": [
+            "tech-advisor-partners"
+          ],
+          "have": [
+            "managed-ai-delivery"
+          ],
+          "glosses": {
+            "managed-ai-delivery": "A team that builds and runs AI in your cloud"
+          },
+          "publicKey": "0htqRnakODm-oKwEvdsA7uwtQAIgF8Xx8RdCu79_Q0U",
+          "keyId": "xcGJsoi4EjR1Cwmo"
+        }
+      }
+    ],
+    "extendedAgentCard": false
+  },
+  "securitySchemes": {},
+  "securityRequirements": [],
+  "defaultInputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "skills": [
+    {
+      "id": "managed-ai-delivery",
+      "name": "managed-ai-delivery",
+      "description": "A team that builds and runs AI in your cloud",
+      "tags": [
+        "managed-ai-delivery"
+      ],
+      "examples": [],
+      "inputModes": [],
+      "outputModes": []
+    }
+  ],
+  "signatures": []
+}

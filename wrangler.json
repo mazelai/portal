@@ -1,0 +1,22 @@
+{
+  "name": "mazel",
+  "main": "portal/src/index.js",
+  "compatibility_date": "2026-01-01",
+  "//": "One Worker per person, on their own Cloudflare account. Deploy to Cloudflare provisions the mailbox and sets the pulse from this file; nothing here needs editing, and nothing personal lives in it. Your handle and your card are written in your first conversation with your own AI, not here.",
+  "kv_namespaces": [
+    {
+      "binding": "MAILBOX"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "*/30 * * * *"
+    ]
+  },
+  "vars": {
+    "RELAY_URL": "https://relay.mazel-peer.workers.dev"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

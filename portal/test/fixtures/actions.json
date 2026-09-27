@@ -1,0 +1,51 @@
+[
+  {
+    "type": "note",
+    "v": 1
+  },
+  {
+    "type": "intro.propose",
+    "v": 1,
+    "introId": "648448b6dff07d08958b1fdee7223c45",
+    "why": "You need someone who has crossed the Atlantic by sailboat; peer@mazel has sailing-atlantic.",
+    "needText": "someone who has crossed the Atlantic by sailboat",
+    "needTags": [
+      "sailing",
+      "atlantic-crossing"
+    ],
+    "matchedTags": [
+      "sailing-atlantic"
+    ],
+    "path": [
+      "ariel@mazel"
+    ],
+    "proposer": {
+      "handle": "ariel@mazel",
+      "cardUrl": "https://mazel.fixture.workers.dev/card",
+      "rpc": "https://mazel.fixture.workers.dev/a2a"
+    }
+  },
+  {
+    "type": "intro.respond",
+    "v": 1,
+    "introId": "648448b6dff07d08958b1fdee7223c45",
+    "decision": "accepted",
+    "note": "Yes.",
+    "path": [
+      "ariel@mazel",
+      "peer@mazel"
+    ]
+  },
+  {
+    "type": "find.request",
+    "v": 1,
+    "needText": "a hockey player in Tokyo",
+    "needTags": [
+      "hockey",
+      "tokyo"
+    ],
+    "path": [
+      "ariel@mazel"
+    ]
+  }
+]

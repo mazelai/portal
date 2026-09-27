@@ -1,0 +1,7 @@
+{
+  "tenant": "",
+  "id": "pulse-1",
+  "taskId": "*",
+  "url": "https://example.invalid/pulse",
+  "token": "t"
+}
