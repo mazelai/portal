@@ -2,12 +2,12 @@
   "v": 1,
   "type": "rotation",
   "handle": "ariel@mazel",
-  "oldKey": "0htqRnakODm-oKwEvdsA7uwtQAIgF8Xx8RdCu79_Q0U",
-  "oldKid": "xcGJsoi4EjR1Cwmo",
-  "newKey": "_D8Ovn_PMbdnh2OwWcZjRuyTVLTQkWLWTn4Q0B0wSAI",
-  "newKid": "5zmu1kVwShmMjqO1",
-  "timestamp": "2026-09-27T08:32:22.479Z",
-  "sig": "pioGnjWKxmaIMD6Cm3o2LxP12_rVl7VUt3Ya_ZaGfZwEojFQLoNgFdssoSbUSjXRAGpduvDtzXbVvhjoqdXtBA",
-  "kid": "xcGJsoi4EjR1Cwmo",
-  "newSig": "7EYwqXNLMoAmew9RUrMQ4Yi9pAPxT--Q2A4czHlwyMqatxbTReupshR6FP7yw8j9w55EQw9RsA80-KzBt8SmBg"
+  "oldKey": "KJeTGqFdebsOqGYqSfEQoMxuCFwOxH0XtsFn3qHXbQ8",
+  "oldKid": "d3VsRIbbYAyZCZxK",
+  "newKey": "DruFmjSPlBUtD1lnIHkLa8lL2kuAkk1Wjx1n55V5OpQ",
+  "newKid": "7ZP2EvlNpnBO9eGd",
+  "timestamp": "2026-09-27T10:42:49.823Z",
+  "sig": "JuYv4JZA7xknazTRELaG0dcdXyFF6nC-jG1ePIV5j2YvVjjOP8O9TxMJBrVdRw7xiuUhu0z_cXjZksTXbt5KDw",
+  "kid": "d3VsRIbbYAyZCZxK",
+  "newSig": "L9RzNqb0D5uPBUCkH72VW2Qbvhkh8Zi0M8nQFByhmoNBaKwK3ify5CfKV6pSBKCwhV8bApZH4XvjK0DzgM18Dg"
 }

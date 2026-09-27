@@ -1,11 +1,11 @@
 {
   "v": 1,
   "handle": "ariel@mazel",
-  "publicKey": "0htqRnakODm-oKwEvdsA7uwtQAIgF8Xx8RdCu79_Q0U",
+  "publicKey": "KJeTGqFdebsOqGYqSfEQoMxuCFwOxH0XtsFn3qHXbQ8",
   "cardUrl": "https://mazel.fixture.workers.dev/.well-known/agent-card.json",
   "rpc": "https://mazel.fixture.workers.dev/a2a",
-  "timestamp": "2026-09-27T08:32:22.478Z",
+  "timestamp": "2026-09-27T10:42:49.821Z",
   "rotations": [],
-  "sig": "YQ_dUnox5eBmQIfZIqFeaThKI6KYQ-0aN2p0Nhgxdk9GoXMg_55exrvMWHYq8EP_UZTxVTCZm8ocOHVmbc3fBw",
-  "kid": "xcGJsoi4EjR1Cwmo"
+  "sig": "vTrCTgxW3xtmuAcbGZt4UjGYEKxBXBX_n2NOz_DZ6Kd6kwyvGZI1x9slyuK_mg2Rf58rij4F21VfTqMhQIn2AA",
+  "kid": "d3VsRIbbYAyZCZxK"
 }

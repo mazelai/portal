@@ -1,10 +1,10 @@
 {
   "name": "create-mazel",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Open your Mazel portal, or update it, in one command. No dashboard.",
   "bin": { "create-mazel": "bin/create-mazel.js" },
   "type": "module",
   "license": "MIT",
   "engines": { "node": ">=18" },
-  "files": ["bin", "worker/index.js", "README.md"]
+  "files": ["bin", "worker", "README.md"]
 }

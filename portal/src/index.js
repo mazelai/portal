@@ -84,7 +84,7 @@ export default {
 // so the card can change any time without a redeploy.
 // Stored shape: { handle, description, need: [{ tag, visibility }], have: [tag] }
 // visibility: "public" (on /card), "matched-only" or "directed" (held by the portal, never on /card).
-const PORTAL_VERSION = "0.4.0";
+const PORTAL_VERSION = "0.4.1";
 const A2A_VERSION = "1.0";
 const HAAH_URI = "https://mazel.ai/ext/haah/v1";
 const DEFAULT_RELAY = "https://relay.mazel-peer.workers.dev";
