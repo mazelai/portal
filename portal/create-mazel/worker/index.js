@@ -1382,7 +1382,9 @@ async function addKnownCard(env, args) {
   if (existing) {
     const prev = JSON.parse(existing);
     known.addedAt = prev.addedAt;
-    known.tier = prev.tier;
+    // Keep whatever tier the person chose before, but a card that only drifted in from the world
+    // becomes theirs when they add it deliberately: adding it by hand is the stronger signal.
+    known.tier = TIERS.includes(args.tier) ? args.tier : prev.tier === "world" ? tier : prev.tier;
     if (prev.url !== url) moved = prev.url;
   }
   await putObj(env, `known:${id}`, known);
@@ -1863,9 +1865,17 @@ async function rememberStranger(env, c) {
   // Even world tier only updates if the key has not changed under it: a different key for the same
   // handle is a different person until a rotation chain says otherwise.
   if (existing && existing.publicKey && c.publicKey && existing.publicKey !== c.publicKey) return existing;
+  // Merge, never clobber. A need-cast carries no haves and no gloss, so writing the incoming
+  // object wholesale blanked the card of anyone who cast a need: they stayed in the list with
+  // nothing to match on, and every later find missed them.
+  const have = (c.have || []).map(normalizeTag).filter(Boolean);
   const known = {
-    id, url: c.url, handle: c.handle, description: String(c.description || "").slice(0, 600), rpc: c.rpc || null,
-    need: [], have: (c.have || []).map(normalizeTag).filter(Boolean), glosses: c.glosses || {}, publicKey: c.publicKey || null,
+    id, url: c.url || (existing && existing.url), handle: c.handle, rpc: c.rpc || (existing && existing.rpc) || null,
+    description: String(c.description || (existing && existing.description) || "").slice(0, 600),
+    need: (existing && existing.need) || [],
+    have: have.length ? have : (existing && existing.have) || [],
+    glosses: Object.keys(c.glosses || {}).length ? c.glosses : (existing && existing.glosses) || {},
+    publicKey: c.publicKey || (existing && existing.publicKey) || null,
     tier: existing ? existing.tier : "world", addedAt: existing ? existing.addedAt : new Date().toISOString(), fetchedAt: new Date().toISOString(), via: existing && existing.via ? existing.via : "world",
   };
   await putObj(env, `known:${id}`, known);

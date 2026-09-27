@@ -122,6 +122,25 @@ await call(A, 'find', { need_text:'someone with lab-ops', tags:['lab-ops'] });
 const afterRpc = JSON.parse(await call(A, 'list_known_cards')).find(c => c.handle === 'lea@mazel').rpc;
 ok('a relay search never rewrites the rpc of a card the person added', afterRpc === beforeRpc, `${beforeRpc} -> ${afterRpc}`);
 
+// A need-cast carries no haves. Remembering someone from one must not blank the card they had.
+{
+  const card = JSON.parse(await call(A, 'list_known_cards')).find(c => c.handle === 'lea@mazel');
+  await rpost('/cast', await evilSign({ v:1, kind:'need', visibility:'public', handle:'lea@mazel', publicKey: evilPub, needId:'n-blank', needText:'lab ops help', needTags:['lab-ops'], castAt: now() }));
+  await call(A, 'find', { need_text:'lab ops help', tags:['lab-ops'] });
+  const after = JSON.parse(await call(A, 'list_known_cards')).find(c => c.handle === 'lea@mazel');
+  ok('a need-cast never blanks the haves of a card already held', (after.have || []).length === (card.have || []).length, `${JSON.stringify(card.have)} -> ${JSON.stringify(after.have)}`);
+}
+
+// The other half of that: a card the cache degraded to world tier becomes the person's again
+// when they add it by hand, or it could never be repaired.
+{
+  const id = [...portals[A].MAILBOX.m.keys()].find(k => k.startsWith('known:'));
+  const rec = JSON.parse(portals[A].MAILBOX.m.get(id)); rec.tier = 'world';
+  portals[A].MAILBOX.m.set(id, JSON.stringify(rec));
+  await call(A, 'add_known_card', { url: B + '/card' });
+  ok('adding a card by hand takes it back out of world tier', JSON.parse(portals[A].MAILBOX.m.get(id)).tier === 'tribe', JSON.parse(portals[A].MAILBOX.m.get(id)).tier);
+}
+
 // ---- finding 3: a name in the directory is not handed to whoever asks first ----
 {
   const rec = await evilSign({ v:1, handle:'lea@mazel', publicKey: evilPub, cardUrl: EVIL + '/card', rpc: EVIL + '/a2a', timestamp: now(), rotations: [] });
