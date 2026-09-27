@@ -93,6 +93,20 @@ if (ask) {
   ok('and that portal is the first to hear them', JSON.stringify(boxB).includes('quiet cofounder search'));
 }
 
+// ---- the cap is on what goes public, not on what the file knows ----
+{
+  const many = { HANDLE:'many@mazel', PERSONA:'p', NEED:'', HAVE:'h1,h2,h3,h4,h5,h6', INBOX_TOKEN:'tm', MAILBOX: mkKV(), PORTAL_ORIGIN: A, RELAY_URL:'none' };
+  const t = async (n, a) => JSON.parse(await (await worker.fetch(new Request(A+'/mcp?token=tm', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:n, arguments:a||{} } }) }), many)).text()).result.content[0].text;
+  await t('my_card');
+  const refused = await t('update_card', { add_have:'h7', confirmed:true });
+  ok('a seventh public have is refused, and the message says what to do instead', /already shows 6 public haves/.test(refused) && /have_visibility/.test(refused), refused.slice(0, 90));
+  const parked = await t('update_card', { add_have:'data-and-crm-migrations', have_visibility:'tribe', witnesses:'hubspot', confirmed:true });
+  ok('the same have goes in at tribe, past the public cap', /Written/.test(parked), parked.split('\n')[0].slice(0, 90));
+  const c = JSON.parse(await t('my_card'));
+  ok('and it is held, not published', c.heldHaves.some(h => h.tag === 'data-and-crm-migrations' && h.tier === 'tribe') && !c.have.includes('data-and-crm-migrations'), JSON.stringify(c.heldHaves));
+  ok('an owner-only have says so, and names the parameter that fixes it', /witness: owner only/.test(await t('update_card', { add_have:'h8', have_visibility:'inner', confirmed:true })));
+}
+
 // ---- the flag that raises the bar in v0.6.0-trust ----
 {
   const strict = { ...portals[A], RELAY_REQUIRES_WITNESS: '1' };

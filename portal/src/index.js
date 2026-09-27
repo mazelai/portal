@@ -130,7 +130,8 @@ const MAX_TAGS = 6;
 async function getCard(env) {
   const s = await getSigning(env);
   const mem = await readMemory(env);
-  return { ...cardFromMemory(mem), unparsed: mem.unparsed, publicKey: s.pub, keyId: s.kid };
+  const max = Number(env.PUBLIC_HAVES_MAX || MAX_TAGS);
+  return { ...cardFromMemory(mem), unparsed: mem.unparsed, publicHavesMax: Number.isFinite(max) && max > 0 ? max : MAX_TAGS, publicKey: s.pub, keyId: s.kid };
 }
 
 async function saveCard(env, card) {
@@ -174,20 +175,22 @@ function parseMemory(md) {
     let rest = m[2].trim();
     if (section === "persona") { mem.persona[tier] = rest; continue; }
     if (section !== "have" && section !== "need") { mem.unparsed.push(line); continue; }
-    let witnesses = [];
+    let witnesses = [], seenAt = null;
+    const sm = rest.match(/\(seen:\s*([^)]*)\)\s*$/i);
+    if (sm) { seenAt = sm[1].trim(); rest = rest.slice(0, sm.index).trim(); }
     const w = rest.match(/\(witnesses:\s*([^)]*)\)\s*$/i);
     if (w) { witnesses = w[1].split(",").map((x) => x.trim().toLowerCase()).filter(Boolean); rest = rest.slice(0, w.index).trim(); }
     const [tagPart, ...glossParts] = rest.split(/\s+[-\u2014]\s+/);
     const tag = normalizeTag(tagPart);
     if (!tag) { mem.unparsed.push(line); continue; }
-    const item = { tag, tier, gloss: glossParts.join(" - ").trim(), witnesses };
+    const item = { tag, tier, gloss: glossParts.join(" - ").trim(), witnesses, seenAt };
     (section === "have" ? mem.have : mem.need).push(item);
   }
   return mem;
 }
 
 function serializeMemory(mem) {
-  const line = (i) => `- [${i.tier}] ${i.tag}${i.gloss ? ` - ${i.gloss}` : ""}${i.witnesses && i.witnesses.length ? ` (witnesses: ${i.witnesses.join(", ")})` : ""}`;
+  const line = (i) => `- [${i.tier}] ${i.tag}${i.gloss ? ` - ${i.gloss}` : ""}${i.witnesses && i.witnesses.length ? ` (witnesses: ${i.witnesses.join(", ")})` : ""}${i.seenAt ? ` (seen: ${i.seenAt})` : ""}`;
   const persona = TIER_ORDER.filter((t) => mem.persona[t]).map((t) => `- [${t}] ${mem.persona[t]}`);
   return [
     MEMORY_HEADER(mem.handle),
@@ -215,6 +218,7 @@ function cardFromMemory(mem) {
     have: mem.have.map((h) => h.tag),
     haveTier: Object.fromEntries(mem.have.map((h) => [h.tag, h.tier])),
     witnesses: Object.fromEntries([...mem.have, ...mem.need].map((i) => [i.tag, i.witnesses || []])),
+    seenAt: Object.fromEntries([...mem.have, ...mem.need].filter((i) => i.seenAt).map((i) => [i.tag, i.seenAt])),
     need: mem.need.map((n) => ({ tag: n.tag, visibility: n.tier })),
     glosses,
   };
@@ -225,8 +229,8 @@ function memoryFromCard(card) {
     handle: card.handle,
     persona: card.personaByTier && Object.keys(card.personaByTier).length ? { ...card.personaByTier, public: card.description || "" } : { public: card.description || "" },
     // A have already on the card is one the person put there, so it carries the owner witness.
-    have: (card.have || []).map((tag) => ({ tag, tier: (card.haveTier || {})[tag] || "public", gloss: (card.glosses || {})[tag] || "", witnesses: ((card.witnesses || {})[tag] || []).length ? card.witnesses[tag] : [OWNER_WITNESS] })),
-    need: (card.need || []).map((n) => ({ tag: n.tag, tier: n.visibility || "public", gloss: (card.glosses || {})[n.tag] || "", witnesses: (card.witnesses || {})[n.tag] || [] })),
+    have: (card.have || []).map((tag) => ({ tag, tier: (card.haveTier || {})[tag] || "public", gloss: (card.glosses || {})[tag] || "", witnesses: ((card.witnesses || {})[tag] || []).length ? card.witnesses[tag] : [OWNER_WITNESS], seenAt: (card.seenAt || {})[tag] || null })),
+    need: (card.need || []).map((n) => ({ tag: n.tag, tier: n.visibility || "public", gloss: (card.glosses || {})[n.tag] || "", witnesses: (card.witnesses || {})[n.tag] || [], seenAt: (card.seenAt || {})[n.tag] || null })),
     unparsed: card.unparsed || [],
   };
 }
@@ -269,12 +273,19 @@ const witnessesOf = (card, tag) => ((card.witnesses || {})[tag] || []).filter(Bo
 const witnessedFor = (card, tag) => witnessesOf(card, tag);
 const corroboratedFor = (card, tag) => witnessesOf(card, tag).filter((w) => w !== OWNER_WITNESS);
 const relayNeedsWitness = (env) => !!(env && String(env.RELAY_REQUIRES_WITNESS || "") === "1");
-const haveAt = (card, tier) => (card.have || []).filter((t) => {
-  const own = (card.haveTier || {})[t] || "public";
-  if (TIER_ORDER.indexOf(own) > TIER_ORDER.indexOf(tier)) return false;   // held above the asker's tier
-  if (tier === "public") return own === "public" && witnessedFor(card, t).length > 0;
-  return true;
-});
+const haveAt = (card, tier) => {
+  const fits = (card.have || []).filter((t) => {
+    const own = (card.haveTier || {})[t] || "public";
+    if (TIER_ORDER.indexOf(own) > TIER_ORDER.indexOf(tier)) return false;   // held above the asker's tier
+    if (tier === "public") return own === "public" && witnessedFor(card, t).length > 0;
+    return true;
+  });
+  // Ordered by evidence: how many witnesses stand behind it, then how recently one did. A card
+  // that shows six things shows the six best-attested, not the six typed first.
+  const seen = (t) => Date.parse((card.seenAt || {})[t] || "") || 0;
+  fits.sort((a, b) => witnessesOf(card, b).length - witnessesOf(card, a).length || seen(b) - seen(a) || a.localeCompare(b));
+  return tier === "public" ? fits.slice(0, card.publicHavesMax || MAX_TAGS) : fits;
+};
 const needAt = (card, tier) => (card.need || []).filter((n) => {
   if (n.visibility === "matched-only" || n.visibility === "directed") return false;  // never as text
   return TIER_ORDER.indexOf(n.visibility) <= TIER_ORDER.indexOf(tier);
@@ -324,6 +335,23 @@ function publicCard(card, origin, tier = "public") {
 }
 
 // Owner's full view: same as public plus the held (non-public) needs.
+// What this card is standing on, and what it is missing. The portal can only see what it has been
+// told: which haves nobody but the person vouches for, and which sources its ghosts came from. The
+// agent knows the rest - what it is actually connected to - so it is asked to fill the gap.
+async function witnessCheck(env, card) {
+  const ghosts = await loadGhosts(env);
+  const bySource = {};
+  for (const g of ghosts) for (const w of g.witnesses || []) bySource[w] = (bySource[w] || 0) + 1;
+  const ownerOnly = (card.have || []).filter((t) => corroboratedFor(card, t).length === 0);
+  return {
+    seen: Object.keys(bySource).sort(),
+    ghostsBySource: bySource,
+    ghosts: ghosts.length,
+    ownerOnlyHaves: ownerOnly,
+    ask: "Enumerate the connectors you actually have. For every one not in `seen`, tell the person in one line what it would add here: roughly how many people it would put in `ghosts`, and which of `ownerOnlyHaves` it could corroborate. Say it once at setup and whenever they ask, not every time.",
+  };
+}
+
 function ownerCard(card, origin) {
   const waiting = (card.have || []).filter((t) => ((card.haveTier || {})[t] || "public") === "public" && witnessesOf(card, t).length === 0);
   const ownerOnly = (card.have || []).filter((t) => witnessesOf(card, t).length > 0 && corroboratedFor(card, t).length === 0);
@@ -368,33 +396,58 @@ function applyCardChange(card, args) {
     changes.push("persona updated");
     publicChanged = true;
   }
-  if (args.add_have) {
-    const tags = tagList(args.add_have);
-    if (!tags.length) throw new Error("add_have: empty tag");
-    const tier = FIELD_TIERS.includes(args.have_tier) ? args.have_tier : null;
-    const witnesses = (Array.isArray(args.witnesses) ? args.witnesses : String(args.witnesses || "").split(","))
-      .map((w) => String(w).trim().toLowerCase()).filter(Boolean).slice(0, 8);
-    next.haveTier = { ...(next.haveTier || {}) };
-    next.witnesses = { ...(next.witnesses || {}) };
-    for (const tag of tags) {
-      if (!next.have.includes(tag)) {
-        if (next.have.length >= MAX_TAGS) throw new Error(`have already has ${MAX_TAGS} tags; remove one first`);
-        next.have.push(tag);
-      }
-      if (tier) next.haveTier[tag] = tier;
-      else if (!next.haveTier[tag]) next.haveTier[tag] = "public";
-      const attested = args.confirmed === true ? [OWNER_WITNESS] : [];
-      next.witnesses[tag] = [...new Set([...(next.witnesses[tag] || []), ...witnesses, ...attested])];
-      const seen = witnessesOf(next, tag);
-      changes.push(`have + ${tag}${seen.length ? ` (witnesses: ${seen.join(", ")})` : " (no witness yet, so it stays inside the portal)"}`);
-    }
-    publicChanged = true;
-  }
+  // Removes run before adds. A call carrying both for the same tag is the person re-stating it,
+  // not deleting it; running the add first quietly threw the new one away.
   if (args.remove_have) {
     const tag = normalizeTag(args.remove_have);
     if (!next.have.includes(tag)) throw new Error(`have does not contain ${tag}`);
     next.have = next.have.filter((t) => t !== tag);
     changes.push(`have - ${tag}`);
+    publicChanged = true;
+  }
+  if (args.remove_need) {
+    const tag = normalizeTag(args.remove_need);
+    const existing = next.need.find((n) => n.tag === tag);
+    if (!existing) throw new Error(`need does not contain ${tag}`);
+    if (existing.visibility === "public") publicChanged = true;
+    next.need = next.need.filter((n) => n.tag !== tag);
+    changes.push(`need - ${tag}`);
+  }
+  if (args.add_have) {
+    const tags = tagList(args.add_have);
+    if (!tags.length) throw new Error("add_have: empty tag");
+    // have_visibility mirrors need_visibility; have_tier is the older name and still works.
+    const asked = args.have_visibility || args.have_tier;
+    const tier = FIELD_TIERS.includes(asked) ? asked : null;
+    const witnesses = (Array.isArray(args.witnesses) ? args.witnesses : String(args.witnesses || "").split(","))
+      .map((w) => String(w).trim().toLowerCase()).filter(Boolean).slice(0, 8);
+    next.haveTier = { ...(next.haveTier || {}) };
+    next.witnesses = { ...(next.witnesses || {}) };
+    for (const tag of tags) {
+      const willBe = tier || next.haveTier[tag] || "public";
+      if (!next.have.includes(tag)) {
+        // The cap is on what goes PUBLIC, not on what the file holds. A have parked at tribe or
+        // inner costs nothing to anyone reading the open card, and the whole point of the memory
+        // file is that more is known than is published.
+        const publicCount = next.have.filter((t) => (next.haveTier[t] || "public") === "public").length;
+        if (willBe === "public" && publicCount >= MAX_TAGS) {
+          throw new Error(`the card already shows ${MAX_TAGS} public haves. Add this one at tribe or inner with have_visibility, or remove a public one first; either way it stays in the memory file.`);
+        }
+        next.have.push(tag);
+      }
+      next.haveTier[tag] = willBe;
+      const attested = args.confirmed === true ? [OWNER_WITNESS] : [];
+      next.witnesses[tag] = [...new Set([...(next.witnesses[tag] || []), ...witnesses, ...attested])];
+      if (witnesses.length) { next.seenAt = { ...(next.seenAt || {}) }; next.seenAt[tag] = new Date().toISOString().slice(0, 10); }
+      const seen = witnessesOf(next, tag);
+      const external = corroboratedFor(next, tag);
+      // Say it out loud when the only thing behind a have is the person's own say-so, and name the
+      // parameter that fixes it: an agent that read this in a tool should record where.
+      const note = !seen.length ? " (no witness yet, so it stays inside the portal)"
+        : !external.length ? " (witness: owner only - if you read this in a tool, pass witnesses: [\"hubspot\", \"gmail\", ...] so it stands on its own)"
+        : ` (witnesses: ${seen.join(", ")})`;
+      changes.push(`have + ${tag}${willBe === "public" ? "" : ` [${willBe}]`}${note}`);
+    }
     publicChanged = true;
   }
   if (args.add_need) {
@@ -425,14 +478,6 @@ function applyCardChange(card, args) {
     if (text) next.glosses[tag] = text.slice(0, 200); else delete next.glosses[tag];
     changes.push(`gloss ${tag}: ${text ? "set" : "cleared"}`);
     if (next.have.includes(tag) || next.need.some((n) => n.tag === tag && n.visibility === "public")) publicChanged = true;
-  }
-  if (args.remove_need) {
-    const tag = normalizeTag(args.remove_need);
-    const existing = next.need.find((n) => n.tag === tag);
-    if (!existing) throw new Error(`need does not contain ${tag}`);
-    if (existing.visibility === "public") publicChanged = true;
-    next.need = next.need.filter((n) => n.tag !== tag);
-    changes.push(`need - ${tag}`);
   }
   if (changes.length === 0) throw new Error("nothing to change: pass persona, add_need, remove_need, add_have, remove_have, or gloss_tag");
   return { card: next, publicChanged, summary: changes.join("; ") };
@@ -683,7 +728,8 @@ const MCP_TOOLS = [
         remove_need: { type: "string", description: "A Need tag to remove" },
         add_have: { type: ["string", "array"], items: { type: "string" }, description: "A Have tag to add, or several at once" },
         witnesses: { type: ["string", "array"], items: { type: "string" }, description: "Where you saw this Have: the tools that corroborate it, like hubspot, gmail, calendar, drive. A Have with no witness stays inside the portal: it never goes on the open card and never reaches the relay." },
-        have_tier: { type: "string", enum: ["public", "tribe", "inner"], description: "How far this Have travels. Default public, which still needs a witness to leave." },
+        have_visibility: { type: "string", enum: ["public", "tribe", "inner"], description: "How far this Have travels, mirroring need_visibility. Default public. Only public Haves count against the cap of six; tribe and inner live in the memory file and are served to peers at that tier through a signed pull." },
+        have_tier: { type: "string", enum: ["public", "tribe", "inner"], description: "Older name for have_visibility; both work." },
         remove_have: { type: "string", description: "A Have tag to remove" },
         gloss_tag: { type: "string", description: "Tag to set a one-line plain description for (helps other agents match)" },
         gloss_text: { type: "string", description: "The one-line description; empty clears it" },
@@ -812,6 +858,51 @@ const MCP_TOOLS = [
       },
       required: ["keys"],
     },
+  },
+  {
+    name: "route_ghost",
+    description:
+      "MAZEL: the person's yes to putting someone they know in front of an ask from their web. A ghost.ask in the mailbox means a stranger's need fits someone this person knows who is not on Mazel. Show them who, the why, and how strong the edge looks; get an explicit yes. On yes this gives you the invitation to send if the person has no card, or sends an ordinary intro if they have one since. On no, do nothing and say nothing: that is the whole point.",
+    inputSchema: { type: "object", properties: { ask_id: { type: "string" }, confirmed: { type: "boolean" } }, required: ["ask_id"] },
+  },
+  {
+    name: "note_ghost",
+    description:
+      "MAZEL: write down someone the person knows who has no Mazel card yet. Build these from every witness you can read on the person's own side - CRM, sent and received mail, calendar, a LinkedIn Connections.csv they hand you - so that the first thing they look for has somewhere to land. " +
+      "Give the display name, the organization's domain, what this person is good for as short tags, the role in a line, the witnesses you read them from, and an edge strength 0-100 that you compute yourself from what you saw: how many threads and how recent, who starts them, how fast replies come, deals and last activity in the CRM, meetings and recency. Say in edge_signals what the number is made of. " +
+      "A ghost stays on this portal, at tribe, visible to the person alone. It is never cast, never forwarded, never put on a card, and its name reaches nobody. The most it can ever do is produce an invitation the person sends themselves. Do not ask the person to type these; read them and confirm the shape of what you wrote.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Display name as the witness has it" },
+        org: { type: "string", description: "Their organization's domain, like acme.com" },
+        email: { type: "string", description: "Used only to compute a short hash bucket for resolution; the address itself is not stored" },
+        have: { type: ["string", "array"], items: { type: "string" }, description: "What they would be good for: short lowercase hyphenated tags" },
+        role: { type: "string", description: "One line on who they are" },
+        witnesses: { type: ["string", "array"], items: { type: "string" }, description: "Where you read them: hubspot, gmail, calendar, linkedin" },
+        edge_score: { type: "number", description: "0-100, how strong this relationship looks from the evidence you have" },
+        edge_signals: { type: "string", description: "What the number is made of, in a line" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "list_ghosts",
+    description: "MAZEL: the people the person knows who have no card yet, strongest edge first. Owner only: these names never leave this portal. Use it to answer 'who do I know who could help with this' and to show what a witness added.",
+    inputSchema: { type: "object", properties: { q: { type: "string", description: "Optional filter over name, org, role and tags" } } },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "forget_ghost",
+    description: "MAZEL: remove a ghost. Use it the moment the person says to, and whenever a ghost turns out to be wrong. No confirmation dance: forgetting someone is always allowed.",
+    inputSchema: { type: "object", properties: { ghost_id: { type: "string" } }, required: ["ghost_id"] },
+  },
+  {
+    name: "invite_text",
+    description:
+      "MAZEL: the words for an invitation to someone who has no card yet. A ghost match is never an introduction: it produces text the person sends themselves, however they like. Show them the text, let them edit it, and let them send it. Nothing is transmitted by the portal, and the ghost's details never leave it.",
+    inputSchema: { type: "object", properties: { ghost_id: { type: "string" }, thread_id: { type: "string" } }, required: ["ghost_id"] },
+    annotations: { readOnlyHint: true },
   },
   {
     name: "my_memory",
@@ -1008,7 +1099,8 @@ async function handleMcp(request, env, origin) {
 async function callTool(name, args, env, origin) {
   if (name === "my_card") {
     if (!(await isClaimed(env))) return FIRST_CONTACT(origin);
-    return JSON.stringify(ownerCard(await getCard(env), origin), null, 2);
+    const card = await getCard(env);
+    return JSON.stringify({ ...ownerCard(card, origin), witnessCheck: await witnessCheck(env, card) }, null, 2);
   }
 
   if (name === "claim_link") {
@@ -1039,6 +1131,64 @@ async function callTool(name, args, env, origin) {
     if (intro.state !== "proposed") throw new Error(`intro ${args.intro_id} is already ${intro.state}; nothing more to answer`);
     const link = await signedLink(env, origin, "/intro", { introId: String(args.intro_id), decision, note: String(args.note || "").slice(0, 500) });
     return `Show them who it is from and the why first, then give them this link. It shows the intro and one button that sends "${decision}". The link lasts ${LINK_MINUTES} minutes.\n\n${link}`;
+  }
+
+  if (name === "route_ghost") {
+    const raw = await env.MAILBOX.get(`ghostask:${String(args.ask_id || "")}`);
+    if (!raw) throw new Error(`no ghost.ask ${args.ask_id}`);
+    const ask = JSON.parse(raw);
+    if (ask.state !== "asked") return `Nothing sent. That one is already ${ask.state}.`;
+    const graw = await env.MAILBOX.get(`ghost:${ask.ghostId}`);
+    if (!graw) throw new Error("that ghost is gone");
+    const g = JSON.parse(graw);
+    if (args.confirmed !== true) {
+      return `Not sent. This puts ${g.name}${g.org ? ` (${g.org})` : ""} in front of ${ask.askerHandle || "someone in your web"} who is looking for ${ask.needText}. Nothing has been said to either of them. Show the person who it is and get a yes, then call again with confirmed: true.`;
+    }
+    ask.state = "routed";
+    ask.routedAt = new Date().toISOString();
+    await putObj(env, `ghostask:${ask.id}`, ask);
+    const me = publicCard(await getCard(env), origin);
+    if (g.resolvedTo) {
+      return `${g.name} has a card now (${g.resolvedTo}). Propose it as an ordinary intro with propose_intro, and you are the router on the outcome.`;
+    }
+    return `Your yes is recorded, and you are the router on whatever comes of it. ${g.name} has no portal, so nothing can be sent for you: here are the words, to send however you like.\n\n${inviteText(me, g, ask.needText, g.have.filter((h) => (ask.needTags || []).includes(h)))}`;
+  }
+
+  if (name === "note_ghost") {
+    if (!args.name) throw new Error("a ghost needs at least a name");
+    const g = await saveGhost(env, args);
+    const seen = g.witnesses.length ? g.witnesses.join(", ") : "none named";
+    return `Noted ${g.name}${g.org ? ` (${g.org})` : ""}: ${g.have.length ? g.have.join(", ") : "no tags yet"}, edge ${g.edge.score}, witnesses ${seen}. They stay on this portal, visible to you alone; nothing about them is cast or forwarded, and the most this can produce is an invitation you send yourself.`;
+  }
+
+  if (name === "list_ghosts") {
+    const q = String(args.q || "").trim().toLowerCase();
+    const all = (await loadGhosts(env))
+      .filter((g) => !q || [g.name, g.org, g.role, ...(g.have || [])].join(" ").toLowerCase().includes(q))
+      .sort((a, b) => (b.edge.score || 0) - (a.edge.score || 0));
+    if (!all.length) return "No ghosts yet. Read the person's CRM, mail, calendar or a LinkedIn export and write what you find with note_ghost.";
+    return JSON.stringify({ count: all.length, note: "Owner only. These names never leave this portal.", ghosts: all }, null, 2);
+  }
+
+  if (name === "forget_ghost") {
+    const raw = await env.MAILBOX.get(`ghost:${String(args.ghost_id || "")}`);
+    if (!raw) throw new Error(`no ghost ${args.ghost_id}`);
+    await env.MAILBOX.delete(`ghost:${args.ghost_id}`);
+    return `Forgotten: ${JSON.parse(raw).name}. Nothing about them is left here.`;
+  }
+
+  if (name === "invite_text") {
+    const raw = await env.MAILBOX.get(`ghost:${String(args.ghost_id || "")}`);
+    if (!raw) throw new Error(`no ghost ${args.ghost_id}`);
+    const g = JSON.parse(raw);
+    let needText = String(args.need_text || "");
+    let matched = [];
+    if (args.thread_id) {
+      const t = JSON.parse((await env.MAILBOX.get(`thread:${args.thread_id}`)) || "null");
+      if (t) { needText = t.need_text; matched = (g.have || []).filter((h) => (t.tags || []).includes(h)); }
+    }
+    const me = publicCard(await getCard(env), origin);
+    return `Show these words to the person, let them edit them, and let them send it however they like. Nothing leaves this portal.\n\n${inviteText(me, g, needText || "something", matched)}`;
   }
 
   if (name === "my_memory") {
@@ -1285,11 +1435,33 @@ async function signPayload(env, payload) {
 // to the relay's directory for name@mazel. Holds public key, portal url, timestamp.
 async function handleRecord(env, origin, card) {
   const s = await getSigning(env);
+  // Opt-in, and a bucket rather than a hash: several addresses share one, so a published record
+  // cannot be turned into a yes-or-no membership check on a guessed address. It says "someone here
+  // might be who you are thinking of" and leaves the humans to settle it. Same trade as the need
+  // fingerprint (§3.6), and the same honest limit: it resists bulk scraping, not a determined
+  // guesser with a short list of addresses to try.
+  const bucket = env.OWNER_EMAIL ? await emailBucket(env.OWNER_EMAIL) : null;
   const payload = {
     v: 1, handle: card.handle, publicKey: s.pub, cardUrl: `${origin}/.well-known/agent-card.json`, rpc: `${origin}/a2a`,
-    timestamp: new Date().toISOString(), rotations: s.rotations,
+    timestamp: new Date().toISOString(), rotations: s.rotations, ...(bucket ? { emailBucket: bucket } : {}),
   };
   return signPayload(env, payload);
+}
+
+// A ghost and a card that fall in the same bucket are probably the same person. "Probably" is the
+// point: the link is written here and nowhere else, never published, and it becomes a witnessed
+// edge the owner can use rather than a claim about anybody.
+async function linkGhosts(env, handle, bucket) {
+  if (!bucket || !handle) return 0;
+  let linked = 0;
+  for (const g of await loadGhosts(env)) {
+    if (g.resolvedTo || g.emailBucket !== bucket) continue;
+    g.resolvedTo = handle;
+    g.resolvedAt = new Date().toISOString();
+    await env.MAILBOX.put(`ghost:${g.id}`, JSON.stringify(g), { expirationTtl: GHOST_TTL });
+    linked++;
+  }
+  return linked;
 }
 
 // Rotation: a record signed by the OLD key naming the new key, countersigned by the new key.
@@ -1358,6 +1530,9 @@ async function resolveHandle(env, handle) {
   if (String(rec.handle).toLowerCase() !== String(handle).toLowerCase().replace(/@mazel$/, "@mazel.ai") && String(rec.handle).toLowerCase() !== String(handle).toLowerCase()) {
     throw new Error(`record at ${url} is for ${rec.handle}, not ${handle}`);
   }
+  // Opportunistic and local: no lookup service, no query anyone else can run. This portal only ever
+  // compares its own ghosts against a record it already had a reason to fetch.
+  if (rec.emailBucket) await linkGhosts(env, rec.handle, rec.emailBucket);
   return rec;
 }
 
@@ -1461,6 +1636,21 @@ const INTRO_STATES = ["proposed", "connected", "declined", "met", "met-continued
 const DECISIONS = ["accepted", "declined"];
 const stateForDecision = (d) => (d === "accepted" ? "connected" : "declined");
 const THREAD_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// Aging is about what happened, not how long ago. A need stays open while there are signs of life
+// and goes quiet on signs of death; the calendar is only a fallback for a need nothing has touched.
+const QUIET_AFTER_PASSES = 3;
+const QUIET_AFTER_SILENT_MS = 60 * 24 * 60 * 60 * 1000;
+const HAVE_DROP_MONTHS = [12, 24];
+
+const alive = (thread) => { thread.lastSignal = new Date().toISOString(); thread.passes = 0; return thread; };
+
+function ageThread(thread) {
+  if (thread.status !== "open") return null;
+  if ((thread.passes || 0) >= QUIET_AFTER_PASSES) return `${QUIET_AFTER_PASSES} passes in a row`;
+  const last = Date.parse(thread.lastSignal || thread.created || "") || 0;
+  if (last && Date.now() - last > QUIET_AFTER_SILENT_MS) return "nothing touched it for 60 days";
+  return null;
+}
 const MAX_CANDIDATES = 5;
 const KV_TTL = 60 * 60 * 24 * 90;
 
@@ -1777,6 +1967,19 @@ async function growThreadsWithCard(env, card) {
   return grown;
 }
 
+// Ghosts scored against a need, exactly like cards, but they can never become candidates.
+async function ghostFits(env, needTags, needWords, needText) {
+  const out = [];
+  for (const g of await loadGhosts(env)) {
+    if (g.resolvedTo) continue;                 // they have a card now; the card path handles them
+    const m = scoreCard({ handle: g.name, description: g.role || "", have: g.have || [], glosses: {}, tier: "tribe" }, needTags, needWords);
+    if (m.score < 2 || !m.matched.length) continue;
+    out.push({ ghost_id: g.id, name: g.name, org: g.org, role: g.role, matched: m.matched, edge: g.edge.score, edge_signals: g.edge.signals, witnesses: g.witnesses,
+      why: `You know ${g.name}${g.org ? ` at ${g.org}` : ""}; they do ${m.matched.join(", ")}. Edge ${g.edge.score}${g.edge.signals ? `: ${g.edge.signals}` : ""}.` });
+  }
+  return out.sort((a, b) => (b.edge || 0) - (a.edge || 0) || b.matched.length - a.matched.length).slice(0, 5);
+}
+
 async function findInKnownCards(env, origin, args) {
   const needText = String(args.need_text || "").trim();
   if (!needText) throw new Error("need_text is required");
@@ -1825,9 +2028,18 @@ async function findInKnownCards(env, origin, args) {
   thread.lastSearched = now.toISOString();
   await putObj(env, `thread:${thread.id}`, thread);
 
+  // People the person knows who have no card yet. These are not candidates: nothing can be
+  // proposed to them, because there is no portal on the other side. They are invitations, and the
+  // person sends them by hand.
+  const invites = await ghostFits(env, needTags, needWords, needText);
+
   // One shape for every answer: a headline to say out loud, plus the data.
-  const base = { thread_id: thread.id, need_text: needText, tags: needTags, status: thread.status, reopened, expires: thread.expires };
+  const base = { thread_id: thread.id, need_text: needText, tags: needTags, status: thread.status, reopened, expires: thread.expires,
+    ...(invites.length ? { invites, invites_note: "People you already know who have no Mazel card. Nothing has been sent and their details have not left this portal. Show them to the person; on a yes, call invite_text(ghost_id, thread_id) and let them send it themselves." } : {}) };
   const lag = " (a card added in the last minute may not be searchable yet; try again shortly)";
+  if (!cards.length && !thread.candidates.length && invites.length) {
+    return JSON.stringify({ ...base, headline: `No card you hold fits "${needText}", but ${invites.length === 1 ? "someone you know does" : invites.length + " people you know do"} and they are not on Mazel yet.`, candidates: [] }, null, 2);
+  }
   if (!cards.length && !thread.candidates.length) {
     return JSON.stringify({ ...base, headline: `Nothing in your cards fits "${needText}": you hold no cards yet${lag}. Add one with add_known_card(url).`, candidates: [], note: `Thread ${thread.id} is open and will match cards as you add them.` }, null, 2);
   }
@@ -1845,7 +2057,7 @@ async function findInKnownCards(env, origin, args) {
   }
   const total = thread.candidates.length;
   return JSON.stringify({ ...base,
-    headline: `✨ ${total === 1 ? "One person fits" : total + " people fit"} this${thread.candidates.some((c) => c.tier === "world") ? ", some from the world 🌍" : ""}.`,
+    headline: `✨ ${total === 1 ? "One person fits" : total + " people fit"} this${thread.candidates.some((c) => c.tier === "world") ? ", some from the world 🌍" : ""}${invites.length ? `, and ${invites.length} you already know ${invites.length === 1 ? "is" : "are"} not on Mazel yet` : ""}.`,
     candidates: await Promise.all(thread.candidates.map(async (c, i) => ({ rank: i + 1, handle: c.handle, card_url: c.cardUrl, rpc: c.rpc, tier: c.tier || "tribe", via: c.via || "known", matched: c.matchedTags, score: c.score, why: c.why, ...(await candidateIntro(env, origin, thread.id, c.cardUrl)) }))),
     next: "Show these to the person. When they pick one, call propose_intro(thread_id, card_url, confirmed: true).",
   }, null, 2);
@@ -1935,6 +2147,16 @@ async function applyInboundAction(env, action, record, origin) {
       intro.decision = action.decision;
       intro.state = stateForDecision(action.decision);
       if (intro.state === "connected") intro.connectedAt = new Date().toISOString();
+      if (intro.threadId) {
+        const traw = await env.MAILBOX.get(`thread:${intro.threadId}`);
+        if (traw) {
+          const t = JSON.parse(traw);
+          // A yes is a sign of life; a pass is a step toward quiet.
+          if (action.decision === "accepted") alive(t);
+          else t.passes = (t.passes || 0) + 1;
+          await putObj(env, `thread:${intro.threadId}`, t);
+        }
+      }
       intro.responseNote = String(action.note || "").slice(0, 500);
       intro.updated = new Date().toISOString();
       await putObj(env, `intro:${action.introId}`, intro);
@@ -2119,6 +2341,64 @@ async function searchRelay(env, origin, thread) {
 }
 
 // A stranger's card (from the relay or a gossip hit) is stored as a WORLD-tier known card.
+// ---------------------------------------------------------------------------
+// Ghosts. A person the agent knows about from a witness who has no card yet: read out of the
+// owner's own CRM, mail, calendar or a LinkedIn export, on the owner's side, and held here so the
+// first cast has somewhere to land.
+//
+// This is other people's data, and it is the one thing in the portal that is. So it is structurally
+// sealed rather than filtered at the call sites: ghosts are not known cards, they are never cast,
+// never forwarded, never projected onto a card at any tier, and never named to anyone but the owner.
+// A ghost can only ever produce an INVITE the owner sends themselves.
+const GHOST_TTL = 60 * 60 * 24 * 365;
+const EMAIL_BUCKET = 3;   // hex characters, same k-anonymity trade as the need fingerprint (§3.6)
+
+async function emailBucket(email) {
+  const norm = String(email || "").trim().toLowerCase();
+  if (!norm || !norm.includes("@")) return null;
+  const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("mazel/email/v1:" + norm));
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, EMAIL_BUCKET);
+}
+
+async function saveGhost(env, g) {
+  const id = await stableId("ghost", (g.email || g.name || "") + "|" + (g.org || ""));
+  const existingRaw = await env.MAILBOX.get(`ghost:${id}`);
+  const existing = existingRaw ? JSON.parse(existingRaw) : null;
+  const ghost = {
+    id,
+    name: String(g.name || "").slice(0, 120),
+    org: String(g.org || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "").slice(0, 120),
+    have: (Array.isArray(g.have) ? g.have : String(g.have || "").split(",")).map(normalizeTag).filter(Boolean).slice(0, MAX_TAGS),
+    role: String(g.role || "").slice(0, 200),
+    edge: { score: Math.max(0, Math.min(100, Number(g.edge_score) || 0)), signals: String(g.edge_signals || "").slice(0, 400), computedAt: new Date().toISOString() },
+    emailBucket: (await emailBucket(g.email)) || (existing && existing.emailBucket) || null,
+    witnesses: [...new Set([...(existing ? existing.witnesses : []), ...((Array.isArray(g.witnesses) ? g.witnesses : String(g.witnesses || "").split(",")).map((w) => String(w).trim().toLowerCase()).filter(Boolean))])].slice(0, 8),
+    tier: "tribe",
+    resolvedTo: existing ? existing.resolvedTo : null,
+    firstSeen: existing ? existing.firstSeen : new Date().toISOString(),
+    updated: new Date().toISOString(),
+  };
+  await env.MAILBOX.put(`ghost:${id}`, JSON.stringify(ghost), { expirationTtl: GHOST_TTL });
+  return ghost;
+}
+
+const loadGhosts = async (env) => (await kvList(env, "ghost:")).map((g) => { const { key, ...rest } = g; return rest; });
+
+// The one thing a ghost ever produces: words the owner sends themselves, to someone whose name
+// never left this portal.
+function inviteText(me, ghost, needText, matched) {
+  const who = ghost.name || "someone you know";
+  return [
+    `To ${who}${ghost.org ? ` (${ghost.org})` : ""}:`,
+    "",
+    `Someone I know is looking for ${needText}${matched.length ? `, and you do ${matched.join(", ")}` : ""}.`,
+    `I use Mazel: my agent holds a small card for me and talks to other people's agents, and it put the two of you together.`,
+    `If you want the introduction, open a portal of your own at https://mazel.ai/install and send me your card link. It takes two minutes and asks you nothing.`,
+    "",
+    `Nobody sees your details but me, and nothing happens unless you say yes.`,
+  ].join("\n");
+}
+
 async function rememberStranger(env, c) {
   const id = await stableId("known", c.handle);
   const existingRaw = await env.MAILBOX.get(`known:${id}`);
@@ -2198,6 +2478,25 @@ async function onFindRequest(env, origin, action, record) {
     const hit = await signedCast(env, origin, { type: "find.hit", via: "gossip", needId, needText: action.needText, needTags, from: { handle: me.handle, cardUrl: `${origin}/.well-known/agent-card.json`, rpc: `${origin}/a2a`, publicKey: (await getSigning(env)).pub }, matchedTags: m.matched, why: `${me.handle} has ${m.matched.join(", ")}; reached through ${(action.path || []).join(" → ")}.`, path: [...(action.path || []), me.handle], at: new Date().toISOString() });
     await deliver(env, origin, originRpc, hit.why, { ...hit, v: 1 }, null);
   }
+  // Someone else's ask may fit someone this person knows who has no card. That is never answered
+  // automatically: the ghost's name is not ours to give, and an intro cannot be made to a portal
+  // that does not exist. The owner is asked, with the why and how strong the edge looks, and
+  // nothing goes back to the asker unless they say yes.
+  const ghosts = await ghostFits(env, needTags, needWords, action.needText);
+  if (ghosts.length && originRpc && /^https:/.test(originRpc)) {
+    const top = ghosts[0];
+    const askId = await stableId("ghostask", needId, top.ghost_id);
+    if (!(await env.MAILBOX.get(`ghostask:${askId}`))) {
+      await putObj(env, `ghostask:${askId}`, { id: askId, ghostId: top.ghost_id, needId, needText: action.needText, needTags, askerHandle: action.handle || null, askerRpc: originRpc, state: "asked", at: new Date().toISOString() });
+      await putObj(env, `msg:${Date.now()}:${askId}`, {
+        id: askId, from: action.handle || "someone in your web",
+        text: `Someone is looking for ${action.needText}. You know ${top.name}${top.org ? ` at ${top.org}` : ""}, who does ${top.matched.join(", ")}. Edge ${top.edge}${top.edge_signals ? `: ${top.edge_signals}` : ""}. Nobody has been told anything, and ${top.name} has no idea. Say yes and you introduce them; say no and this never happened.`,
+        action: { type: "ghost.ask", v: 1, askId, ghostId: top.ghost_id, needText: action.needText },
+        receivedAt: new Date().toISOString(),
+      });
+    }
+  }
+
   // Forward once more if hops remain, to public-tier known cards, signature intact.
   const hops = Number(action.hops || 0);
   if (hops + 1 < (action.maxHops || MAX_HOPS)) {
@@ -2214,13 +2513,29 @@ async function onFindRequest(env, origin, action, record) {
 // somewhere lines up on enough buckets to be worth asking about. So this does not become a
 // candidate and does not become a known card. It becomes one question for the person, in private,
 // and their yes is what lets any words travel.
+// A need that went quiet is not a need that ended. When something finally fits, the person is
+// asked once - not every time, or quiet would mean nothing.
+async function wakeOrAsk(env, thread) {
+  if (thread.status === "open") return true;
+  if (thread.status !== "quiet" || thread.askedOnQuiet) return false;
+  thread.askedOnQuiet = new Date().toISOString();
+  await putObj(env, `thread:${thread.id}`, thread);
+  await putObj(env, `msg:${Date.now()}:${thread.id}`, {
+    id: thread.id, from: "your own portal",
+    text: `"${thread.need_text}" went quiet (${thread.quietBecause || "nothing touched it"}), and something has just come up that fits. Still looking? Say yes and it reopens; otherwise this stays quiet and you will not be asked again.`,
+    action: { type: "quiet.ask", v: 1, threadId: thread.id },
+    receivedAt: new Date().toISOString(),
+  });
+  return false;
+}
+
 async function onBlindHit(env, origin, action, record) {
   const key = await hitKey(env, action);
   if (!key || !(await verifyPayload(action, key))) return;
   const raw = await env.MAILBOX.get(`thread:${action.needId}`);
   if (!raw) return;
   const thread = JSON.parse(raw);
-  if (thread.status !== "open") return;
+  if (!(await wakeOrAsk(env, thread))) return;
   const who = action.from || {};
   if (!/^https:\/\//.test(String(who.rpc || ""))) return;
   const id = await stableId("blind", action.needId, who.rpc);
@@ -2278,7 +2593,7 @@ async function onFindHit(env, origin, action, record) {
     const raw = await env.MAILBOX.get(`thread:${action.needId}`);
     if (raw) {
       const thread = JSON.parse(raw);
-      if (thread.status === "open") {
+      if (await wakeOrAsk(env, thread)) {
         // Score is this portal's own judgement of the card, never a number the sender chose.
         const needTags = (thread.tags || []).map(normalizeTag).filter(Boolean);
         const m = scoreCard({ ...known, tier: "world" }, needTags, needWordsFor(thread.need_text, needTags));
@@ -2292,6 +2607,24 @@ async function onFindHit(env, origin, action, record) {
 
 // The pulse: one cast per open public need on every carrier, one score pass over what landed,
 // one badge line. Quiet when nothing hit. Also keeps the card, subscription and directory fresh.
+// A have nobody has corroborated for a year slides one tier; after two, one more. Nothing is
+// deleted and nothing is decided for the person: it just stops being the first thing strangers see.
+async function ageHaves(env) {
+  const card = await getCard(env);
+  const moved = [];
+  const next = { ...card, haveTier: { ...(card.haveTier || {}) } };
+  for (const tag of card.have || []) {
+    const seen = Date.parse((card.seenAt || {})[tag] || "") || 0;
+    if (!seen) continue;
+    const months = (Date.now() - seen) / (30 * 24 * 60 * 60 * 1000);
+    const tier = next.haveTier[tag] || "public";
+    if (months >= HAVE_DROP_MONTHS[1] && tier === "tribe") { next.haveTier[tag] = "inner"; moved.push({ tag, to: "inner" }); }
+    else if (months >= HAVE_DROP_MONTHS[0] && tier === "public") { next.haveTier[tag] = "tribe"; moved.push({ tag, to: "tribe" }); }
+  }
+  if (moved.length) await saveCard(env, next);
+  return moved;
+}
+
 async function runPulse(env, origin, how) {
   if (!origin) return "Pulse skipped: PORTAL_ORIGIN is not set for scheduled runs.";
   const lines = [];
@@ -2301,6 +2634,8 @@ async function runPulse(env, origin, how) {
   await publishRecord(env, origin);
   await castCard(env, origin);
   await subscribeRelay(env, origin);
+  const slid = await ageHaves(env);
+  if (slid.length) lines.push(`Nothing has corroborated ${slid.map((x) => x.tag).join(", ")} in a long time, so ${slid.length === 1 ? "it" : "they"} moved in a tier. Name a witness any time to bring ${slid.length === 1 ? "it" : "them"} back.`);
   let casts = 0, hits = 0;
   for (const t of await loadThreads(env)) {
     if (t.status !== "open") continue;
@@ -2325,6 +2660,14 @@ async function runPulse(env, origin, how) {
     await addCandidates(env, fresh, found);
     const added = fresh.candidates.length - before;
     if (added > 0) { hits += added; lines.push(`✨ "${fresh.need_text}": ${added} new from the world 🌍 (${fresh.candidates.slice(before).map((c) => c.handle).join(", ")})`); }
+    if (added > 0) alive(fresh);
+    const why = ageThread(fresh);
+    if (why) {
+      fresh.status = "quiet";
+      fresh.quietAt = new Date().toISOString();
+      fresh.quietBecause = why;
+      lines.push(`"${fresh.need_text}" went quiet: ${why}. It stays on file and wakes on a new hit.`);
+    }
     fresh.lastPulse = new Date().toISOString();
     await putObj(env, `thread:${fresh.id}`, fresh);
   }

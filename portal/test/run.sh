@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 node --check ../src/index.js && (cd ../../relay && node build.mjs >/dev/null) && git -C ../.. diff --quiet -- relay/src/index.js || { echo "!! relay/src/index.js is stale: run relay/build.mjs and commit"; exit 1; }
-for t in sec-test m15-test crawl-test a2a-conformance identity-test relay-test fly-test install-test seed-test cli-test; do
+for t in sec-test m15-test crawl-test a2a-conformance identity-test relay-test fly-test install-test seed-test ghosts-test cli-test; do
   echo "== $t"
   out=$(node "$t.mjs" 2>&1 | grep -vE 'MODULE_TYPELESS|Reparsing|eliminate this|trace-warnings') || true
   echo "$out" | grep -E 'passed|skipping|^FAIL' || true
