@@ -70,6 +70,14 @@ const told = { HANDLE:'you@mazel', PERSONA:'', NEED:'', HAVE:'', MAILBOX: mkKV()
 await get(told, '/');
 ok('a portal that was told its address does not write one', !told.MAILBOX.m.has('config:origin'));
 
+// 6c. A relay is optional: RELAY_URL=none turns the carrier off and nothing reaches out to a cache.
+const solo = { HANDLE:'solo@mazel', PERSONA:'p', NEED:'', HAVE:'x', INBOX_TOKEN:'ts', MAILBOX: mkKV(), RELAY_URL:'none', PORTAL_ORIGIN: O };
+const carriers = JSON.parse(await mcp(solo, 'carriers', {}, 'ts'));
+ok('RELAY_URL=none turns the relay carrier off', carriers.relay === false && carriers.relayUrl === null && carriers.known === true && carriers.gossip === true, JSON.stringify(carriers));
+const pulsed = await mcp(solo, 'pulse', {}, 'ts');
+ok('a portal with no relay still pulses, on the carriers it has, and claims nothing it did not do', !/^Error/.test(pulsed) && /cast on known, gossip\./.test(pulsed) && !/subscription/.test(pulsed), pulsed.split('\n')[0]);
+ok('and says plainly that name@mazel cannot be resolved without one', /has no relay/.test(await mcp(solo, 'resolve_handle', { handle:'lea@mazel' }, 'ts')));
+
 // 7. The quiet rule rides on the tools that can produce something to say.
 const tools = (await (await worker.fetch(new Request(`${O}/mcp?token=${token}`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list' }) }), fresh)).json()).result.tools;
 const byName = Object.fromEntries(tools.map(t => [t.name, t.description]));

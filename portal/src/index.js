@@ -88,7 +88,13 @@ const PORTAL_VERSION = "0.4.1";
 const A2A_VERSION = "1.0";
 const HAAH_URI = "https://mazel.ai/ext/haah/v1";
 const DEFAULT_RELAY = "https://relay.mazel-peer.workers.dev";
-const relayUrl = (env) => (env && env.RELAY_URL && String(env.RELAY_URL).trim()) || DEFAULT_RELAY;
+// A relay is optional. RELAY_URL=none turns the carrier off entirely: the portal then finds people
+// through the cards it holds and through gossip, and never talks to a cache at all.
+const relayUrl = (env) => {
+  const v = env && env.RELAY_URL ? String(env.RELAY_URL).trim() : "";
+  if (/^(none|off|no|false)$/i.test(v)) return null;
+  return v || DEFAULT_RELAY;
+};
 const HAAH_DESCRIPTION = "Mazel HAAH: a handle, Need and Have tags with one-line glosses, and the find / intro actions carried in message metadata. See https://mazel.ai";
 const VISIBILITIES = ["public", "matched-only", "directed"];
 const MAX_TAGS = 6;
@@ -936,6 +942,7 @@ function directoryUrlFor(handle, env) {
   if (!m) throw new Error("handle must look like name@domain");
   const [, name, domain] = m;
   const base = domain === "mazel" || domain === "mazel.ai" ? relayUrl(env) : `https://${domain}`;
+  if (!base) throw new Error(`this portal has no relay (RELAY_URL=none), so it cannot resolve ${handle}; use a name@domain handle, which resolves at the domain itself`);
   return { name, domain, url: `${base}/.well-known/mazel/${name}.json` };
 }
 
@@ -1013,6 +1020,7 @@ const CARRIERS = (env) => ({ known: true, relay: !!relayUrl(env), gossip: true, 
 function relayUnreachableReason(env, origin) {
   try {
     const mine = new URL(origin).host.split(".").slice(1).join(".");
+    if (!relayUrl(env)) return null;
     const theirs = new URL(relayUrl(env)).host.split(".").slice(1).join(".");
     if (mine.endsWith("workers.dev") && mine === theirs) return `relay ${relayUrl(env)} is on this portal's own Cloudflare account (${mine}); Workers cannot reach each other there (error 1042). Point RELAY_URL at a relay on another account.`;
   } catch {}
@@ -1102,8 +1110,9 @@ async function rotateKeyTool(env, origin, args) {
   if (args.confirmed !== true) return "Not rotated. Rotating changes the key every peer will verify against; the old key stops signing. Confirm with the person, then call again with confirmed: true.";
   const rotation = await rotateKey(env, origin);
   const card = await getCard(env);
-  let published = "not published (relay unreachable)";
+  let published = relayUrl(env) ? "not published (relay unreachable)" : "not published (this portal has no relay)";
   try {
+    if (!relayUrl(env)) throw new Error("no relay");
     const rec = await handleRecord(env, origin, card);
     const res = await fetch(`${relayUrl(env)}/publish`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(rec) });
     published = res.ok ? "published to the directory" : `relay answered HTTP ${res.status}`;
@@ -1548,6 +1557,7 @@ async function signedCast(env, origin, extra) {
 }
 
 async function relayPost(env, path, body) {
+  if (!relayUrl(env)) return { ok: false, status: 0, body: { error: "this portal has no relay" } };
   try {
     const res = await fetch(`${relayUrl(env)}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const j = await res.json().catch(() => ({}));
@@ -1580,6 +1590,7 @@ async function publishRecord(env, origin) {
 
 // Search the relay for a public need; results become world-tier known cards and thread candidates.
 async function searchRelay(env, origin, thread) {
+  if (!relayUrl(env)) return [];
   try {
     const u = `${relayUrl(env)}/search?q=${encodeURIComponent(thread.need_text)}&tags=${encodeURIComponent((thread.tags || []).join(","))}`;
     const res = await fetch(u, { headers: { accept: "application/json" } });
@@ -1731,7 +1742,7 @@ async function runPulse(env, origin, how) {
   if (hits) {
     await env.MAILBOX.put(`msg:${Date.now()}:pulse-${crypto.randomUUID().slice(0, 8)}`, JSON.stringify({ id: crypto.randomUUID(), receivedAt: new Date().toISOString(), fromHandle: "pulse", fromCard: null, action: { type: "note", v: 1, pulse: true }, text: summary }), { expirationTtl: 60 * 60 * 24 * 7 });
   }
-  return `Pulse (${how}): ${casts} need${casts === 1 ? "" : "s"} cast on ${Object.entries(carriers).filter(([, on]) => on).map(([k]) => k).join(", ")}; card cast and subscription refreshed.` + (warn ? `\n⚠ ${warn}` : "") + (hits ? `\n${summary}` : " Nothing new landed; quiet.");
+  return `Pulse (${how}): ${casts} need${casts === 1 ? "" : "s"} cast on ${Object.entries(carriers).filter(([, on]) => on).map(([k]) => k).join(", ")}${relayUrl(env) ? "; card cast and subscription refreshed" : ""}.` + (warn ? `\n⚠ ${warn}` : "") + (hits ? `\n${summary}` : " Nothing new landed; quiet.");
 }
 
 // ---------------------------------------------------------------------------
