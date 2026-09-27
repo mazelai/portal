@@ -30,7 +30,9 @@ ok('a wrong token still gets nothing', (await worker.fetch(new Request(`${O}/mcp
 const script = await mcp(fresh, 'my_card', {}, token);
 ok('my_card on an unclaimed portal returns the first conversation', /nobody has claimed it yet/.test(script) && /one question/.test(script), script.slice(0,80));
 ok('it asks for a handle and nothing else', /handle/.test(script) && /only thing you ask/.test(script));
-ok('it tells the agent to draft from what it already knows, not from their mail', /already know/.test(script) && /Do not read their email/.test(script));
+ok('it tells the agent to draft from what it already knows, not from their mail', /already know about me from our conversations/.test(script) && /Don't read my email/.test(script));
+ok('it carries the canonical card prompt, closer and all', /Two things: is anything/.test(script) && /what's burning right now/.test(script));
+ok('it says where a sensitive need goes instead of the public card', /matched-only/.test(script) && /directed/.test(script));
 
 // 3. The claim: one call writes the whole card.
 const unconfirmed = await mcp(fresh, 'update_card', { handle:'lea@mazel', persona:'Lea builds biotech teams.', add_have:['biotech-recruiting','lab-ops'], add_need:'seed-investors' }, token);
