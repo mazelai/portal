@@ -39,6 +39,18 @@ export default {
       return handleRoot(env, origin);
     }
 
+    // The person's own browser doing what a read-only connector cannot. See "Signed links".
+    if (url.pathname === "/claim" || url.pathname === "/intro") {
+      const params = request.method === "POST"
+        ? new URLSearchParams(await request.text())
+        : url.searchParams;
+      let payload;
+      try { payload = await openLink(env, url.pathname, params); } catch (e) { return linkError(e.message); }
+      return url.pathname === "/claim"
+        ? handleClaimLink(env, origin, payload, params, request.method === "POST")
+        : handleIntroLink(env, origin, payload, params, request.method === "POST");
+    }
+
     if ((url.pathname === "/card" || url.pathname === "/.well-known/agent-card.json") && request.method === "GET") {
       return json(agentCard(await getCard(env), origin, env));
     }
@@ -623,6 +635,41 @@ const MCP_TOOLS = [
       required: ["keys"],
     },
   },
+  {
+    name: "claim_link",
+    description:
+      "MAZEL: the way to set up a portal when you cannot write. Some hosts give a connector read access only (ChatGPT does this on individual plans), so update_card is not callable. " +
+      "Draft the card exactly as first contact describes, then call this instead: it returns one link to the person's OWN portal showing the draft with a single Save button. Give them the link and let them press it; their browser does the write. " +
+      "Only ever use it when update_card is unavailable or has failed. The link lasts 30 minutes and works once the person opens it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        handle: { type: "string", description: "Their handle, like lea@mazel" },
+        persona: { type: "string", description: "Two or three plain sentences, in their register" },
+        have: { type: ["string", "array"], items: { type: "string" }, description: "What they can offer someone: short lowercase hyphenated tags" },
+        need: { type: ["string", "array"], items: { type: "string" }, description: "What they are looking for: short lowercase hyphenated tags" },
+        held_need: { type: ["string", "array"], items: { type: "string" }, description: "Needs they would not want strangers reaching them about. Held by the portal, never on the public card." },
+      },
+      required: ["handle"],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "respond_intro_link",
+    description:
+      "MAZEL: answer an intro when you cannot write. Same situation as claim_link: a read-only connector cannot call respond_intro. " +
+      "This returns one link to the person's own portal showing who proposed the intro, the why and the path, with a single button that sends their answer. Show them the intro in plain words first, as always, then give them the link.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        intro_id: { type: "string" },
+        decision: { type: "string", enum: ["accepted", "declined"] },
+        note: { type: "string", description: "Optional line back to the proposer" },
+      },
+      required: ["intro_id", "decision"],
+    },
+    annotations: { readOnlyHint: true },
+  },
 ];
 
 // The whole install lives here: one question, a draft, a yes. Everything personal happens in the
@@ -675,6 +722,9 @@ const FIRST_CONTACT = (origin) => [
   "4. On yes, call update_card with handle, persona, add_have, add_need and confirmed: true.",
   "   add_have and add_need each take a list, so the public part of the card goes in one call; make",
   "   a second call for any matched-only or directed need.",
+  "   If update_card is not available to you at all, your host has given this connector read access",
+  "   only. Call claim_link with the same draft instead: it hands back one link to this portal that",
+  "   shows the person their card and saves it when they press the button.",
   "",
   "5. Say once that their card is live and their needs will start travelling. Then go quiet.",
   "",
@@ -753,6 +803,35 @@ async function callTool(name, args, env, origin) {
   if (name === "my_card") {
     if (!(await isClaimed(env))) return FIRST_CONTACT(origin);
     return JSON.stringify(ownerCard(await getCard(env), origin), null, 2);
+  }
+
+  if (name === "claim_link") {
+    if (await isClaimed(env)) return `This portal already belongs to ${(await getCard(env)).handle}. claim_link only sets up a portal nobody has claimed.`;
+    const handle = String(args.handle || "").trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9._-]*@[a-z0-9][a-z0-9.-]*$/.test(handle)) throw new Error(`handle ${args.handle} is not a handle: it looks like lea@mazel`);
+    const draft = {
+      handle,
+      persona: String(args.persona || "").trim(),
+      have: tagList(args.have || []),
+      need: [
+        ...tagList(args.need || []).map((tag) => ({ tag, visibility: "public" })),
+        ...tagList(args.held_need || []).map((tag) => ({ tag, visibility: "matched-only" })),
+      ],
+    };
+    const link = await signedLink(env, origin, "/claim", draft);
+    return `Give the person this link and ask them to open it. It shows the card you drafted and one Save button; pressing it claims the portal as ${handle}. The link lasts ${LINK_MINUTES} minutes.\n\n${link}\n\nSay it in your own words: this is their own portal asking them to confirm, and nothing is public until they press it.`;
+  }
+
+  if (name === "respond_intro_link") {
+    const decision = args.decision === "accepted" ? "accepted" : args.decision === "declined" ? "declined" : null;
+    if (!decision) throw new Error("decision must be accepted or declined");
+    const raw = await env.MAILBOX.get(`intro:${String(args.intro_id || "")}`);
+    if (!raw) throw new Error(`no intro ${args.intro_id}`);
+    const intro = JSON.parse(raw);
+    if (intro.direction !== "received") throw new Error(`intro ${args.intro_id} was proposed by you; the other side responds`);
+    if (intro.state !== "proposed") throw new Error(`intro ${args.intro_id} is already ${intro.state}; nothing more to answer`);
+    const link = await signedLink(env, origin, "/intro", { introId: String(args.intro_id), decision, note: String(args.note || "").slice(0, 500) });
+    return `Show them who it is from and the why first, then give them this link. It shows the intro and one button that sends "${decision}". The link lasts ${LINK_MINUTES} minutes.\n\n${link}`;
   }
 
   if (name === "update_card") {
@@ -869,6 +948,81 @@ async function verifyPayload(signed, pubB64u) {
   }
 }
 // ---- SHARED SIGNING END ----
+
+// ---------------------------------------------------------------------------
+// Signed links. Some AI hosts give a connector read access only: ChatGPT disables write-shaped
+// tools for individual plans. So the agent drafts, and hands the person a link to their OWN portal
+// that carries the draft; their browser does the write. Same rule as always, the person says yes.
+//
+// The link is authenticated by a MAC derived from this portal's signing key, so only something
+// holding the mailbox key could have asked for it, and it expires. Nothing is stored to make one:
+// minting a link is a pure read, which is exactly why a read-only connector can do it.
+const LINK_MINUTES = 30;
+
+async function linkMac(env, payload) {
+  const sign = await getSigning(env);
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode("mazel/link/v1:" + sign.priv.d),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+  );
+  return b64u(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload))).slice(0, 32);
+}
+
+async function signedLink(env, origin, path, obj) {
+  const exp = Date.now() + LINK_MINUTES * 60000;
+  const d = b64u(new TextEncoder().encode(JSON.stringify(obj)));
+  return `${origin}${path}?d=${d}&e=${exp}&s=${await linkMac(env, `${path}.${d}.${exp}`)}`;
+}
+
+async function openLink(env, path, params) {
+  const d = params.get("d") || "", e = Number(params.get("e") || 0), sig = params.get("s") || "";
+  if (!d || !e || !sig) throw new Error("This link is incomplete. Ask your AI for a fresh one.");
+  if (Date.now() > e) throw new Error(`This link expired after ${LINK_MINUTES} minutes. Ask your AI for a fresh one.`);
+  if ((await linkMac(env, `${path}.${d}.${e}`)) !== sig) throw new Error("This link was not made by this portal.");
+  return JSON.parse(new TextDecoder().decode(unb64u(d)));
+}
+
+const esc = (v) => String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+// One page, two states: here is what your agent wrote, and one button. Never a form to fill.
+function linkPage(title, bodyHtml, buttonLabel, params) {
+  const hidden = buttonLabel
+    ? `<form method="POST"><input type="hidden" name="d" value="${esc(params.get("d"))}"><input type="hidden" name="e" value="${esc(params.get("e"))}"><input type="hidden" name="s" value="${esc(params.get("s"))}"><button type="submit">${esc(buttonLabel)}</button></form>`
+    : "";
+  return new Response(`<!doctype html><meta charset="utf-8"><title>${esc(title)}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
+<style>
+ :root { --ink:#15130f; --bg:#fbfaf7; --dim:#6b6357; --line:#e6e1d8; --go:#1a6d5a; }
+ @media (prefers-color-scheme: dark) { :root { --ink:#f2efe9; --bg:#131211; --dim:#a29a8d; --line:#2c2a26; --go:#54c3a6; } }
+ body { margin:0; background:var(--bg); color:var(--ink); font:17px/1.6 ui-serif, Georgia, serif; }
+ main { max-width:34rem; margin:0 auto; padding:3rem 1.15rem 4rem; }
+ h1 { font-size:1.6rem; margin:0 0 1rem; }
+ dt { font:600 13px/1.6 ui-sans-serif, system-ui, sans-serif; text-transform:uppercase; letter-spacing:.04em; color:var(--dim); margin-top:1.1rem; }
+ dd { margin:.15rem 0 0; }
+ .tag { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:.1rem .6rem; margin:.2rem .25rem .2rem 0; font-size:.95rem; }
+ .held { color:var(--dim); border-style:dashed; }
+ button { margin-top:2rem; font:600 16px/1 ui-sans-serif, system-ui, sans-serif; background:var(--go); color:#fff; border:0; border-radius:10px; padding:.9rem 1.4rem; cursor:pointer; }
+ .note { color:var(--dim); font-size:.95rem; margin-top:1.25rem; }
+</style>
+<main><h1>${esc(title)}</h1>${bodyHtml}${hidden}</main>`,
+    { status: 200, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+}
+
+const linkError = (message) => linkPage("This link did not work", `<p>${esc(message)}</p>`, null, null);
+
+function draftHtml(d) {
+  const tags = (list, held) => (list || []).map((t) => `<span class="tag${held ? " held" : ""}">${esc(t)}</span>`).join(" ") || `<span class="note">none</span>`;
+  const pub = (d.need || []).filter((n) => n.visibility === "public").map((n) => n.tag);
+  const heldNeeds = (d.need || []).filter((n) => n.visibility !== "public");
+  return `<p class="note">Your AI wrote this. Nothing is public until you press the button.</p>
+<dl>
+ <dt>Handle</dt><dd>${esc(d.handle)}</dd>
+ <dt>Persona</dt><dd>${esc(d.persona)}</dd>
+ <dt>What you can offer</dt><dd>${tags(d.have)}</dd>
+ <dt>What you are looking for</dt><dd>${tags(pub)}</dd>
+ ${heldNeeds.length ? `<dt>Held back, never on the public card</dt><dd>${heldNeeds.map((n) => `<span class="tag held">${esc(n.tag)} &middot; ${esc(n.visibility)}</span>`).join(" ")}</dd>` : ""}
+</dl>`;
+}
 
 async function getSigning(env) {
   const raw = await env.MAILBOX.get("config:signing");
@@ -1285,8 +1439,6 @@ async function loadThreads(env) {
   }
   return threads;
 }
-
-
 
 // A new card is offered to every open thread it fits, so a need cast yesterday
 // picks up someone met today without being recast.
@@ -1865,6 +2017,39 @@ async function handleRoot(env, origin) {
     ? `${(await getCard(env)).handle || "someone"} has a Mazel portal here.\nCard: ${origin}/card\nTalk: POST ${origin}/a2a (JSON-RPC message/send)\n`
     : await welcomePage(env, origin);
   return new Response(body, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+}
+
+async function handleClaimLink(env, origin, draft, params, write) {
+  if (await isClaimed(env)) {
+    return linkPage("Already set up", `<p>This portal already belongs to ${esc((await getCard(env)).handle)}. To change the card, tell your AI what changed.</p>`, null, null);
+  }
+  if (!write) return linkPage("Your Mazel card", draftHtml(draft), "Save it and open my portal", params);
+
+  let card = await getCard(env);
+  card = applyCardChange(card, { handle: draft.handle, persona: draft.persona, add_have: draft.have || [], confirmed: true }).card;
+  for (const n of draft.need || []) {
+    card = applyCardChange(card, { add_need: n.tag, need_visibility: n.visibility, confirmed: true }).card;
+  }
+  await saveCard(env, card);
+  await env.MAILBOX.put("config:claimed", new Date().toISOString());
+  return linkPage("Your portal is open", `<p>This portal is <strong>${esc(card.handle)}</strong> from now on. Your card is live at <a href="${esc(origin)}/card">${esc(origin)}/card</a>, and your needs start travelling on the next pulse, within half an hour.</p><p class="note">Go back to your AI and carry on there.</p>`, null, null);
+}
+
+async function handleIntroLink(env, origin, payload, params, write) {
+  const raw = await env.MAILBOX.get(`intro:${payload.introId}`);
+  if (!raw) return linkError(`That intro is no longer in this portal's mailbox.`);
+  const intro = JSON.parse(raw);
+  const who = (intro.from && intro.from.handle) || "someone";
+  if (intro.state !== "proposed") {
+    return linkPage("Already answered", `<p>Intro ${esc(payload.introId)} is already <strong>${esc(intro.state)}</strong>. Nothing more to answer.</p>`, null, null);
+  }
+  if (!write) {
+    return linkPage(payload.decision === "accepted" ? "Say yes to this intro?" : "Pass on this intro?",
+      `<dl><dt>From</dt><dd>${esc(who)}</dd><dt>Why</dt><dd>${esc(intro.why || "")}</dd>${(intro.path || []).length ? `<dt>Path</dt><dd>${esc((intro.path || []).join(" &rarr; "))}</dd>` : ""}${payload.note ? `<dt>Your note back</dt><dd>${esc(payload.note)}</dd>` : ""}</dl><p class="note">Nothing is sent until you press the button. ${payload.decision === "accepted" ? "You meet only if they said yes too." : "A pass closes it cleanly, and they are told nothing more than that."}</p>`,
+      payload.decision === "accepted" ? "Yes, introduce us" : "No thanks", params);
+  }
+  const said = await respondIntro(env, origin, { intro_id: payload.introId, decision: payload.decision, note: payload.note, confirmed: true });
+  return linkPage(payload.decision === "accepted" ? "Sent" : "Passed", `<p>${esc(said.split("\n")[0])}</p><p class="note">Go back to your AI and carry on there.</p>`, null, null);
 }
 
 async function welcomePage(env, origin) {

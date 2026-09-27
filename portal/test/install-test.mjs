@@ -5,6 +5,7 @@ const mkKV = () => { const m = new Map(); return { m, get: async k => m.get(k) ?
 const O = 'https://mazel.fresh.workers.dev';
 const realFetch = globalThis.fetch;
 globalThis.fetch = async () => new Response('harness: no network', { status: 503 });
+const isClaimedNow = async (env) => !!env.MAILBOX.m.get('config:claimed');
 let pass=0, fail=0; const ok=(l,c,x='')=>{ console.log((c?'PASS ':'FAIL ')+l+(x?'  -> '+String(x).replace(/\n/g,' ').slice(0,120):'')); c?pass++:fail++; };
 
 // A button deploy: wrangler.json vars only, no secret, no handle.
@@ -77,6 +78,66 @@ ok('RELAY_URL=none turns the relay carrier off', carriers.relay === false && car
 const pulsed = await mcp(solo, 'pulse', {}, 'ts');
 ok('a portal with no relay still pulses, on the carriers it has, and claims nothing it did not do', !/^Error/.test(pulsed) && /cast on known, gossip\./.test(pulsed) && !/subscription/.test(pulsed), pulsed.split('\n')[0]);
 ok('and says plainly that name@mazel cannot be resolved without one', /has no relay/.test(await mcp(solo, 'resolve_handle', { handle:'lea@mazel' }, 'ts')));
+
+// 6d. Signed links: what a read-only connector can still do. The agent drafts, the person's own
+// browser writes. Nothing is stored to mint a link, so minting one is genuinely a read.
+const gpt = { HANDLE:'you@mazel', PERSONA:'', NEED:'', HAVE:'', MAILBOX: mkKV(), RELAY_URL:'https://relay.test', PORTAL_ORIGIN: O };
+await get(gpt, '/');
+const gptToken = (await (await get(gpt, '/')).text()).match(/token=([a-f0-9]+)/)[1];
+const kvBefore = gpt.MAILBOX.m.size;
+const linkOut = await mcp(gpt, 'claim_link', { handle:'lea@mazel', persona:'Lea builds biotech teams.', have:['biotech-recruiting','lab-ops'], need:'seed-investors', held_need:'quiet-cofounder-search' }, gptToken);
+const claimUrl = (linkOut.match(/https:\/\/\S+\/claim\?\S+/) || [])[0];
+ok('claim_link hands back a link to the person own portal', !!claimUrl && claimUrl.startsWith(O + '/claim?'), linkOut.split('\n')[0]);
+ok('minting a link writes nothing, so a read-only host can do it', gpt.MAILBOX.m.size === kvBefore, `${kvBefore} -> ${gpt.MAILBOX.m.size}`);
+const toolList = (await (await worker.fetch(new Request(`${O}/mcp?token=${gptToken}`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list' }) }), gpt)).json()).result.tools;
+const linkTools = toolList.filter(t => t.name === 'claim_link' || t.name === 'respond_intro_link');
+ok('both link tools declare themselves read-only, which is what the host gates on', linkTools.length === 2 && linkTools.every(t => t.annotations && t.annotations.readOnlyHint === true));
+
+const showUrl = new URL(claimUrl);
+page = await (await worker.fetch(new Request(claimUrl), gpt)).text();
+ok('opening the link shows the draft, not a form to fill', /lea@mazel/.test(page) && /Lea builds biotech teams/.test(page) && /biotech-recruiting/.test(page) && !/<input type="text"|<textarea/.test(page));
+ok('it shows a held need as held, and says nothing is public yet', /quiet-cofounder-search/.test(page) && /matched-only/.test(page) && /Nothing is public until you press/.test(page));
+ok('it never puts the mailbox key on the page', !page.includes(gptToken));
+ok('looking is not saving', !(await isClaimedNow(gpt)), 'claimed too early');
+
+const post = (url, body) => worker.fetch(new Request(url, { method:'POST', headers:{'content-type':'application/x-www-form-urlencoded'}, body }), gpt);
+const form = `d=${encodeURIComponent(showUrl.searchParams.get('d'))}&e=${encodeURIComponent(showUrl.searchParams.get('e'))}&s=${encodeURIComponent(showUrl.searchParams.get('s'))}`;
+page = await (await post(O + '/claim', form)).text();
+ok('pressing the button claims the portal', /portal is open/i.test(page) && /lea@mazel/.test(page), page.slice(0,80));
+const gptCard = JSON.parse(await (await get(gpt, '/card')).text());
+const gptHaah = gptCard.capabilities.extensions.find(e => /haah/.test(e.uri)).params;
+ok('the card it wrote is the card the agent drafted', gptHaah.handle === 'lea@mazel' && gptHaah.have.includes('lab-ops') && gptHaah.need.includes('seed-investors'));
+ok('a held need never reaches the public card', !JSON.stringify(gptHaah).includes('quiet-cofounder-search'), JSON.stringify(gptHaah.need));
+ok('the setup link stops once the portal is claimed this way', !/mcp\?token=[a-f0-9]{16,}/.test(await (await get(gpt, '/')).text()));
+ok('claim_link refuses once there is an owner', /already belongs to/.test(await mcp(gpt, 'claim_link', { handle:'someone@mazel' }, gptToken)));
+
+// A link nobody could have minted, and one that has aged out, are both refused.
+const other = { HANDLE:'you@mazel', PERSONA:'', NEED:'', HAVE:'', MAILBOX: mkKV(), RELAY_URL:'https://relay.test', PORTAL_ORIGIN: O };
+ok('a link from another portal is refused', /not made by this portal/.test(await (await worker.fetch(new Request(claimUrl), other)).text()));
+ok('a tampered draft is refused', /not made by this portal/.test(await (await worker.fetch(new Request(claimUrl.replace(/d=[^&]+/, 'd=' + Buffer.from('{"handle":"attacker@mazel"}').toString('base64url'))), other)).text()));
+const stale = claimUrl.replace(/e=\d+/, 'e=' + (Date.now() - 1000));
+ok('an aged-out link is refused', /expired/.test(await (await worker.fetch(new Request(stale), gpt)).text()));
+
+// The same rule for answering an intro.
+const peerSeen = [];
+const netlessFetch = globalThis.fetch;
+globalThis.fetch = async (u, i = {}) => {
+  if (String(u).startsWith('https://peer.test')) { peerSeen.push(JSON.parse(i.body)); return new Response(JSON.stringify({ jsonrpc:'2.0', id:'1', result:{ message:{ messageId:'ack', role:'ROLE_AGENT', parts:[{ text:'ack' }] } } }), { headers:{'content-type':'application/json'} }); }
+  return netlessFetch(u, i);
+};
+gpt.MAILBOX.m.set('intro:i1', JSON.stringify({ intro_id:'i1', direction:'received', state:'proposed', why:'You have lab-ops; sam@mazel needs it.', path:['sam@mazel'], from:{ handle:'sam@mazel', rpc:'https://peer.test/a2a' }, created:new Date().toISOString() }));
+const introOut = await mcp(gpt, 'respond_intro_link', { intro_id:'i1', decision:'accepted', note:'Tuesdays work.' }, gptToken);
+const introUrl = (introOut.match(/https:\/\/\S+\/intro\?\S+/) || [])[0];
+ok('respond_intro_link hands back a link for the answer', !!introUrl, introOut.split('\n')[0]);
+page = await (await worker.fetch(new Request(introUrl), gpt)).text();
+ok('it shows who, the why and the path before anything is sent', /sam@mazel/.test(page) && /needs it/.test(page) && /Nothing is sent until you press/.test(page));
+ok('looking does not answer', peerSeen.length === 0 && JSON.parse(gpt.MAILBOX.m.get('intro:i1')).state === 'proposed');
+const iu = new URL(introUrl);
+page = await (await post(O + '/intro', `d=${encodeURIComponent(iu.searchParams.get('d'))}&e=${encodeURIComponent(iu.searchParams.get('e'))}&s=${encodeURIComponent(iu.searchParams.get('s'))}`)).text();
+ok('pressing the button sends the answer to the proposer', peerSeen.some(m => (m.params.message.metadata.action || {}).type === 'intro.respond' && m.params.message.metadata.action.decision === 'accepted'), JSON.stringify(peerSeen.map(m => (m.params.message.metadata.action||{}).type)));
+ok('the note the agent drafted travels with it', peerSeen.some(m => (m.params.message.metadata.action || {}).note === 'Tuesdays work.'));
+ok('answering twice is refused', /already/i.test(await (await worker.fetch(new Request(introUrl), gpt)).text()));
+globalThis.fetch = netlessFetch;
 
 // 7. The quiet rule rides on the tools that can produce something to say.
 const tools = (await (await worker.fetch(new Request(`${O}/mcp?token=${token}`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list' }) }), fresh)).json()).result.tools;

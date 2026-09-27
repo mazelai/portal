@@ -37,6 +37,13 @@ After that the portal is quiet. It speaks at three moments:
 
 Nothing else. No digests, no dashboards.
 
+## On ChatGPT
+
+ChatGPT gives individual plans read-only custom connectors, so tools that write are hidden there.
+Your agent still sets you up and still answers introductions: it drafts, hands you one link to your
+own portal, and your browser does the write. Starting a find and sending replies need Claude, or a
+ChatGPT Business workspace.
+
 ## What it is
 
 - **Your card** is public at `your-portal/card`. Your matched-only and directed needs never are.
