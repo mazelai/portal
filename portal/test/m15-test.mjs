@@ -15,7 +15,11 @@ const card = async () => flat(JSON.parse(await (await worker.fetch(req('/card'),
 let pass=0, fail=0; const ok=(l,c,x='')=>{ console.log((c?'PASS ':'FAIL ')+l+(x?'  -> '+String(x).replace(/\n/g,' ').slice(0,110):'')); c?pass++:fail++; };
 
 const c0 = await card();
-ok('seed: card served from vars', c0.handle==='ariel@mazel' && c0.need.length===4 && c0.have.length===5);
+// A have the person put on their own card carries the owner witness, the weakest kind: public and
+// on the relay for now. Naming a tool it was read from is what makes it stand on its own.
+ok('seed: card served from vars', c0.handle==='ariel@mazel' && c0.need.length===4 && c0.have.length===5, JSON.stringify(c0.have));
+ok('a seeded have carries the owner witness and nothing else', JSON.parse(await tool('my_card',{})).ownerAttestedOnly.length === 5);
+ok('naming a tool corroborates it', (await tool('update_card',{add_have:'managed-ai-delivery', witnesses:'hubspot,gmail', confirmed:true})).startsWith('Written') && !JSON.parse(await tool('my_card',{})).ownerAttestedOnly.includes('managed-ai-delivery'));
 ok('seed written to KV', store.has('config:card'));
 ok('public add without confirmed is refused', (await tool('update_card',{add_need:'Fractional CFO'})).startsWith('Not written'));
 ok('public add with confirmed writes', (await tool('update_card',{add_need:'Fractional CFO', confirmed:true})).startsWith('Written'));
@@ -25,7 +29,7 @@ ok('directed need needs no confirm and never appears publicly', (await tool('upd
 ok('owner view shows held needs', JSON.parse(await tool('my_card',{})).heldNeeds.some(n=>n.tag==='foundry-data-engineers'));
 ok('persona edit', (await tool('update_card',{persona:'New persona.', confirmed:true})).startsWith('Written') && (await card()).description==='New persona.');
 ok('POST /card without token is 401', (await worker.fetch(req('/card','POST',{add_have:'x'},false), env)).status===401);
-ok('POST /card add_have confirmed', (await worker.fetch(req('/card','POST',{add_have:'channel-partner-intros', confirmed:true}), env)).status===200 && (await card()).have.includes('channel-partner-intros'));
+ok('POST /card add_have confirmed', (await worker.fetch(req('/card','POST',{add_have:'channel-partner-intros', witnesses:['hubspot'], confirmed:true}), env)).status===200 && (await card()).have.includes('channel-partner-intros'));
 for (const t of ['a','b','c']) await tool('update_card',{add_need:t, confirmed:true});
 ok('7th public need hits the cap', /already has 6 public tags/.test(await tool('update_card',{add_need:'d', confirmed:true})));
 ok('gloss on a have appears publicly', (await tool('update_card',{gloss_tag:'managed-ai-delivery', gloss_text:'A team that runs AI in your cloud', confirmed:true})).startsWith('Written') && /cloud/.test((await card()).glosses['managed-ai-delivery']));

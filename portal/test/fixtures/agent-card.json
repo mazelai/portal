@@ -13,7 +13,7 @@
     "organization": "Mazel",
     "url": "https://mazel.ai"
   },
-  "version": "0.4.1",
+  "version": "0.4.2",
   "documentationUrl": "https://mazel.ai",
   "capabilities": {
     "streaming": false,
@@ -35,8 +35,8 @@
           "glosses": {
             "managed-ai-delivery": "A team that builds and runs AI in your cloud"
           },
-          "publicKey": "KJeTGqFdebsOqGYqSfEQoMxuCFwOxH0XtsFn3qHXbQ8",
-          "keyId": "d3VsRIbbYAyZCZxK"
+          "publicKey": "ZMcIQRreShNN0zsj-aNrsIEsvA2epH4IxiOBtKNty-c",
+          "keyId": "6Pe4xDPojlUbat36"
         }
       }
     ],

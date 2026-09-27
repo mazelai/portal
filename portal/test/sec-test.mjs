@@ -234,5 +234,44 @@ ok('a relay search never rewrites the rpc of a card the person added', afterRpc 
   ok('a listing follows its cursor instead of stopping at the first page', pages > 1, `${pages} pages`);
 }
 
+// Seeding, part one: the memory file is the source and the card is a projection of it.
+{
+  const seed = { HANDLE:'seed@mazel', PERSONA:'Runs labs.', NEED:'', HAVE:'lab-ops', INBOX_TOKEN:'ts', MAILBOX: mkKV(), PORTAL_ORIGIN: A, RELAY_URL:'none' };
+  const mcpSeed = async (n, a) => JSON.parse(await (await worker.fetch(new Request(A + '/mcp?token=ts', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:n, arguments:a||{} } }) }), seed)).text()).result.content[0].text;
+  await mcpSeed('my_card');
+  const md = await (await worker.fetch(new Request(A + '/memory?token=ts'), seed)).text();
+  ok('the portal keeps a memory file the owner can read', /## Have/.test(md) && /lab-ops/.test(md), md.split('\n').find(l => /lab-ops/.test(l)));
+  ok('the memory file is not public', (await worker.fetch(new Request(A + '/memory'), seed)).status === 401);
+  ok('a seeded have carries the owner witness', /\(witnesses: owner\)/.test(md));
+
+  // Tier projection: an open GET can only ever be public.
+  await mcpSeed('update_card', { add_have:'board-prep', have_tier:'inner', witnesses:'drive', confirmed:true });
+  const open = JSON.parse(await (await worker.fetch(new Request(A + '/card'), seed)).text());
+  const params = open.capabilities.extensions.find(e => /haah/.test(e.uri)).params;
+  ok('an inner have never appears on the open card', !params.have.includes('board-prep'), JSON.stringify(params.have));
+
+  // A matched-only need travels as buckets and never as text, on any carrier.
+  await mcpSeed('update_card', { add_need:'quiet-cofounder-search', need_visibility:'matched-only' });
+  const card2 = JSON.parse(await mcpSeed('my_card'));
+  ok('a matched-only need is held, not published', card2.heldNeeds.some(n => n.tag === 'quiet-cofounder-search') && !card2.need.includes('quiet-cofounder-search'));
+  const wire = JSON.stringify(open) + md.split('## Need')[0];
+  ok('its words appear on no wire', !/quiet-cofounder-search/.test(JSON.stringify(open)));
+}
+
+// One version, derived everywhere. This fails if any of them is edited on its own.
+{
+  const { readFileSync } = await import('node:fs');
+  const at = (f) => readFileSync(new URL(f, import.meta.url), 'utf8');
+  const source = (at('../src/index.js').match(/const PORTAL_VERSION = "([^"]+)"/) || [])[1];
+  const others = {
+    'portal/package.json': JSON.parse(at('../package.json')).version,
+    'create-mazel/package.json': JSON.parse(at('../create-mazel/package.json')).version,
+    'VERSION': at('../../VERSION').trim(),
+    'relay (stamped at build)': (at('../../relay/src/index.js').match(/const RELAY_VERSION = "([^"]+)"/) || [])[1],
+  };
+  const wrong = Object.entries(others).filter(([, v]) => v !== source);
+  ok('every version in the tree derives from PORTAL_VERSION', wrong.length === 0, wrong.map(([k, v]) => `${k}=${v} vs ${source}`).join(', '));
+}
+
 globalThis.fetch = netFetch;
 console.log(`\n${pass} passed, ${failN} failed`);

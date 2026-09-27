@@ -2,7 +2,7 @@
 
 **It is a cache: deleting it loses nothing any portal doesn't hold.**
 
-The relay is the Fly stage's public carrier. It runs on the Mazel company account and never carries a message between two people (spec §19 row C stands). What it does:
+The relay is the Fly stage's public carrier. It runs on the Mazel company account and never carries a message between two people (spec §7.5, the cache principle). What it does:
 
 - **`POST /cast`** — a portal casts a signed public need (or its public card). Verified against the key inside it; stored 7 days. Only public-tier material; matched-only and directed needs never leave a portal.
 - **`GET /search?q=&tags=`** — the same paraphrase scorer the portal uses, run over cached casts. Results are strangers' cards, which land in the searching portal as world-tier (🌍) known cards. The intro then goes portal to portal on the A2A wire, as always.

@@ -13,7 +13,7 @@
     "handle": "sailor@mazel",
     "cardUrl": "https://mazel.s.workers.dev/.well-known/agent-card.json",
     "rpc": "https://mazel.s.workers.dev/a2a",
-    "publicKey": "DruFmjSPlBUtD1lnIHkLa8lL2kuAkk1Wjx1n55V5OpQ"
+    "publicKey": "1Yw0LGhpAiX_I5VUQGPTeqQqqbF8Z7xO6mHx3U02llM"
   },
   "matchedTags": [
     "sailing-atlantic"
@@ -22,7 +22,7 @@
   "path": [
     "ariel@mazel"
   ],
-  "at": "2026-09-27T10:42:49.852Z",
+  "at": "2026-09-27T22:25:24.001Z",
   "sig": "<sig>",
   "kid": "<kid>"
 }

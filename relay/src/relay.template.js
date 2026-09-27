@@ -2,7 +2,7 @@
 //
 // It is a cache: deleting it loses nothing any portal doesn't hold.
 //
-// It never carries a message between two people (spec §19 row C stands). It caches signed public
+// It never carries a message between two people (spec §7.5, the cache principle). It caches signed public
 // casts and cards, answers searches over them, keeps the name@mazel directory from signed records
 // portals publish, and tells a subscribed portal that a matching cast exists. Every intro, reply and
 // connect still goes portal to portal on the A2A wire.
@@ -18,7 +18,7 @@
 // GET  /.well-known/relay.json          this relay's public key
 // GET  /                the sentence above
 
-const RELAY_VERSION = "0.4.0";
+const RELAY_VERSION = "@@VERSION@@";   // stamped by relay/build.mjs from the portal
 const HAAH_URI = "https://mazel.ai/ext/haah/v1";
 const CAST_TTL = 60 * 60 * 24 * 7;
 const SUB_TTL = 60 * 60 * 24 * 30;
@@ -220,8 +220,10 @@ async function cast(env, origin, body) {
   if (!body || typeof body !== "object") throw new Error("body must be a signed cast");
   if (!body.publicKey || !body.sig) throw new Error("cast needs publicKey and sig");
   if (!(await verifyPayload(body, body.publicKey))) throw new Error("cast is not signed by its publicKey");
-  if (body.visibility && body.visibility !== "public") throw new Error("only public casts belong here");
-  const kind = body.kind === "card" ? "card" : "need";
+  const blind = body.kind === "blind";
+  if (!blind && body.visibility && body.visibility !== "public") throw new Error("only public casts belong here");
+  if (blind && (!Array.isArray(body.fp) || !body.fp.length)) throw new Error("a blind cast carries a fingerprint and nothing else");
+  const kind = blind ? "blind" : body.kind === "card" ? "card" : "need";
   const handle = String(body.handle || "").toLowerCase();
   if (!handle.includes("@")) throw new Error("cast needs a handle");
   // If this directory holds the name, only the key that holds it may cast under it.
@@ -236,10 +238,14 @@ async function cast(env, origin, body) {
   // Keyed by the signing key, not by the handle. Keying by handle let anyone with a fresh keypair
   // overwrite the cached card of a handle they do not own, and every portal that searched picked up
   // their rpc for that person.
-  const id = kind === "need"
-    ? await stableId("need", body.publicKey, body.needId || body.needText || "")
-    : await stableId("card", body.publicKey);
-  const record = {
+  const id = kind === "card"
+    ? await stableId("card", body.publicKey)
+    : await stableId(kind, body.publicKey, body.needId || body.needText || "");
+  // A blind cast is stored with no text of any kind: buckets, an id, and who to answer.
+  const record = blind ? {
+    id, kind, handle, publicKey: body.publicKey, rpc: body.rpc || null, needId: body.needId || null,
+    fp: body.fp.slice(0, 64).map(String), tier: "world", castAt: body.castAt,
+  } : {
     id, kind, handle, publicKey: body.publicKey, cardUrl: body.cardUrl || null, rpc: body.rpc || null,
     needId: body.needId || null, needText: String(body.needText || "").slice(0, 300), needTags: (body.needTags || []).map(normalizeTag).filter(Boolean),
     have: capTags(body.have), glosses: capGlosses(body.glosses),
@@ -312,7 +318,7 @@ async function subscribe(env, body) {
   if (mine.length >= MAX_SUBS_PER_KEY) throw new Error(`a key may hold ${MAX_SUBS_PER_KEY} subscriptions here`);
   const id = await stableId("sub", handle, cfg.url);
   // No push token is kept: an unauthenticated cache is the wrong place to hold somebody's bearer.
-  const record = { id, handle, publicKey: body.publicKey, url: cfg.url, taskId: String(cfg.taskId || "*"), have: capTags(body.have), glosses: capGlosses(body.glosses), description: String(body.description || "").slice(0, 600), createdAt: new Date().toISOString() };
+  const record = { id, handle, publicKey: body.publicKey, url: cfg.url, taskId: String(cfg.taskId || "*"), have: capTags(body.have), glosses: capGlosses(body.glosses), haveFp: (Array.isArray(body.haveFp) ? body.haveFp : []).slice(0, 64).map(String), description: String(body.description || "").slice(0, 600), createdAt: new Date().toISOString() };
   await put(env, `sub:${id}`, record, SUB_TTL);
   return json({ ok: true, id, expiresInSeconds: SUB_TTL, sentence: SENTENCE });
 }
@@ -325,8 +331,34 @@ async function unsubscribe(env, body) {
   return json({ ok: true, id });
 }
 
+// A blind cast is matched on buckets alone. The answer says a number and nothing else: no text
+// travels in either direction until the person who owns the need decides it should.
+async function notifyBlind(env, origin, castRecord) {
+  const subs = await kvList(env, "sub:");
+  let delivered = 0;
+  for (const s of subs) {
+    if (delivered >= MAX_FANOUT) break;
+    if (s.publicKey === castRecord.publicKey) continue;
+    const overlap = fpOverlap(castRecord.fp, s.haveFp || []);
+    if (overlap < FP_MATCH_MIN) continue;
+    const hit = await relaySign(env, { v: 1, type: "find.hit", via: "relay", relay: origin, blind: true, needId: castRecord.needId, overlap, at: new Date().toISOString(), from: { handle: s.handle, cardUrl: s.url, rpc: s.url, publicKey: s.publicKey } });
+    const why = `A portal may fit something you are holding back: ${overlap} signals in common. Nothing was said about what you are looking for.`;
+    try {
+      const res = await fetch(castRecord.rpc, {
+        method: "POST", headers: { "content-type": "application/json", "A2A-Version": "1.0" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: hit.needId || crypto.randomUUID(), method: "SendMessage", params: { message: {
+          messageId: await stableId("blind", s.id, castRecord.id), contextId: "", taskId: "*", role: "ROLE_AGENT", parts: [{ text: why }],
+          metadata: { handle: `relay@${new URL(origin).host}`, cardUrl: `${origin}/.well-known/relay.json`, action: hit }, extensions: [HAAH_URI], referenceTaskIds: [] } } }),
+      });
+      if (res.ok) delivered++;
+    } catch {}
+  }
+  return delivered;
+}
+
 // For a new need-cast, find subscribers whose haves fit it and deliver a find.hit to each.
 async function notifySubscribers(env, origin, castRecord) {
+  if (castRecord.kind === "blind") return notifyBlind(env, origin, castRecord);
   if (castRecord.kind !== "need") return 0;
   const subs = await kvList(env, "sub:");
   const needWords = needWordsFor(castRecord.needText, castRecord.needTags);
@@ -364,6 +396,7 @@ function text(s, status = 200) {
   return new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 }
 
+// @@SHARED-FP@@
 // @@SHARED-MATCH@@
 
 // @@SHARED-SIGNING@@

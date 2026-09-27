@@ -52,7 +52,21 @@ export default {
     }
 
     if ((url.pathname === "/card" || url.pathname === "/.well-known/agent-card.json") && request.method === "GET") {
-      return json(agentCard(await getCard(env), origin, env));
+      // An open URL can only ever carry the public projection. A peer who wants the richer one
+      // signs for it with the key on their own card, and gets whatever tier this portal has put
+      // them at: tribe or inner, never more than the person chose.
+      const as = url.searchParams.get("as");
+      let tier = "public";
+      if (as) {
+        tier = await tierForPull(env, as, url.searchParams);
+        if (!tier) return json({ error: "that signature does not match the card this portal holds for you" }, 403);
+      }
+      return json(agentCard(await getCard(env), origin, env, tier));
+    }
+
+    if (url.pathname === "/memory" && request.method === "GET") {
+      if (!(await authorized(request, url, env))) return json({ error: "unauthorized" }, 401);
+      return new Response(await env.MAILBOX.get(MEMORY_KEY), { headers: { "content-type": "text/markdown; charset=utf-8", "cache-control": "no-store" } });
     }
 
     // Any domain can be a directory: a portal serves its own signed handle record here.
@@ -96,7 +110,9 @@ export default {
 // so the card can change any time without a redeploy.
 // Stored shape: { handle, description, need: [{ tag, visibility }], have: [tag] }
 // visibility: "public" (on /card), "matched-only" or "directed" (held by the portal, never on /card).
-const PORTAL_VERSION = "0.4.1";
+// THE version. Everything else is derived from this line: the relay is stamped from it at
+// build, and a suite test fails if any package.json or the VERSION file disagrees.
+const PORTAL_VERSION = "0.4.2";
 const A2A_VERSION = "1.0";
 const HAAH_URI = "https://mazel.ai/ext/haah/v1";
 const DEFAULT_RELAY = "https://relay.mazel-peer.workers.dev";
@@ -112,39 +128,173 @@ const VISIBILITIES = ["public", "matched-only", "directed"];
 const MAX_TAGS = 6;
 
 async function getCard(env) {
-  const raw = await env.MAILBOX.get("config:card");
   const s = await getSigning(env);
-  if (raw) return { ...JSON.parse(raw), publicKey: s.pub, keyId: s.kid };
-  const seeded = {
+  const mem = await readMemory(env);
+  return { ...cardFromMemory(mem), unparsed: mem.unparsed, publicKey: s.pub, keyId: s.kid };
+}
+
+async function saveCard(env, card) {
+  await writeMemory(env, card);
+}
+
+// ---------------------------------------------------------------------------
+// The memory file. This is where the person lives in their portal: a markdown file they can read
+// and edit, written by their agent as it learns. The card other people see is a PROJECTION of this
+// file and never a source: only [public] lines go on the open card, an uncorroborated have never
+// leaves at all, and a matched-only need never travels as text on any carrier.
+//
+// Tiers: public | tribe | inner | matched-only | directed.
+const MEMORY_KEY = "memory:card.md";
+const TIER_ORDER = ["public", "tribe", "inner"];
+const FIELD_TIERS = ["public", "tribe", "inner", "matched-only", "directed"];
+const MEMORY_HEADER = (handle) => `# Mazel memory - ${handle}
+
+Your agent writes this file as it learns, and you can edit it by hand. The card other people see is
+a projection of it, never the other way round: only [public] lines go on the open card, a have with
+no witness never leaves this portal, and a matched-only need travels as a fingerprint, never as text.
+
+Tiers: public, tribe, inner, matched-only, directed.
+Format: - [tier] tag - one line about it (witnesses: where you saw it)
+`;
+
+const ITEM = /^-\s*\[([a-z-]+)\]\s*(.*)$/;
+
+function parseMemory(md) {
+  const mem = { handle: "", persona: {}, have: [], need: [], unparsed: [] };
+  let section = null;
+  for (const line of String(md || "").split("\n")) {
+    const h = line.match(/^##\s+(\w+)/);
+    if (h) { section = h[1].toLowerCase(); continue; }
+    const top = line.match(/^#\s+Mazel memory\s*[-\u2014]\s*(\S+)/);
+    if (top) { mem.handle = top[1]; continue; }
+    if (!line.trim().startsWith("-")) continue;
+    const m = line.match(ITEM);
+    if (!m || !FIELD_TIERS.includes(m[1])) { if (line.trim()) mem.unparsed.push(line); continue; }
+    const tier = m[1];
+    let rest = m[2].trim();
+    if (section === "persona") { mem.persona[tier] = rest; continue; }
+    if (section !== "have" && section !== "need") { mem.unparsed.push(line); continue; }
+    let witnesses = [];
+    const w = rest.match(/\(witnesses:\s*([^)]*)\)\s*$/i);
+    if (w) { witnesses = w[1].split(",").map((x) => x.trim().toLowerCase()).filter(Boolean); rest = rest.slice(0, w.index).trim(); }
+    const [tagPart, ...glossParts] = rest.split(/\s+[-\u2014]\s+/);
+    const tag = normalizeTag(tagPart);
+    if (!tag) { mem.unparsed.push(line); continue; }
+    const item = { tag, tier, gloss: glossParts.join(" - ").trim(), witnesses };
+    (section === "have" ? mem.have : mem.need).push(item);
+  }
+  return mem;
+}
+
+function serializeMemory(mem) {
+  const line = (i) => `- [${i.tier}] ${i.tag}${i.gloss ? ` - ${i.gloss}` : ""}${i.witnesses && i.witnesses.length ? ` (witnesses: ${i.witnesses.join(", ")})` : ""}`;
+  const persona = TIER_ORDER.filter((t) => mem.persona[t]).map((t) => `- [${t}] ${mem.persona[t]}`);
+  return [
+    MEMORY_HEADER(mem.handle),
+    "## Persona",
+    ...(persona.length ? persona : ["- [public] "]),
+    "",
+    "## Have",
+    ...mem.have.map(line),
+    "",
+    "## Need",
+    ...mem.need.map(line),
+    ...(mem.unparsed.length ? ["", "## Unparsed", "<!-- kept verbatim: these lines did not match the format above -->", ...mem.unparsed] : []),
+    "",
+  ].join("\n");
+}
+
+// The runtime card every other part of the portal already speaks, built from the file.
+function cardFromMemory(mem) {
+  const glosses = {};
+  for (const i of [...mem.have, ...mem.need]) if (i.gloss) glosses[i.tag] = i.gloss;
+  return {
+    handle: mem.handle,
+    description: mem.persona.public || "",
+    personaByTier: mem.persona,
+    have: mem.have.map((h) => h.tag),
+    haveTier: Object.fromEntries(mem.have.map((h) => [h.tag, h.tier])),
+    witnesses: Object.fromEntries([...mem.have, ...mem.need].map((i) => [i.tag, i.witnesses || []])),
+    need: mem.need.map((n) => ({ tag: n.tag, visibility: n.tier })),
+    glosses,
+  };
+}
+
+function memoryFromCard(card) {
+  return {
+    handle: card.handle,
+    persona: card.personaByTier && Object.keys(card.personaByTier).length ? { ...card.personaByTier, public: card.description || "" } : { public: card.description || "" },
+    // A have already on the card is one the person put there, so it carries the owner witness.
+    have: (card.have || []).map((tag) => ({ tag, tier: (card.haveTier || {})[tag] || "public", gloss: (card.glosses || {})[tag] || "", witnesses: ((card.witnesses || {})[tag] || []).length ? card.witnesses[tag] : [OWNER_WITNESS] })),
+    need: (card.need || []).map((n) => ({ tag: n.tag, tier: n.visibility || "public", gloss: (card.glosses || {})[n.tag] || "", witnesses: (card.witnesses || {})[n.tag] || [] })),
+    unparsed: card.unparsed || [],
+  };
+}
+
+async function readMemory(env) {
+  const md = await env.MAILBOX.get(MEMORY_KEY);
+  if (md) return parseMemory(md);
+  // Migration: a portal that predates the file builds one from the card it already has, once.
+  const raw = await env.MAILBOX.get("config:card");
+  const old = raw ? JSON.parse(raw) : {
     handle: env.HANDLE || "unnamed@mazel",
     description: (env.PERSONA || "").trim(),
     need: splitTags(env.NEED).map((tag) => ({ tag, visibility: "public" })),
     have: splitTags(env.HAVE),
   };
-  await env.MAILBOX.put("config:card", JSON.stringify(seeded));
-  return { ...seeded, publicKey: s.pub, keyId: s.kid };
+  const mem = memoryFromCard(old);
+  await env.MAILBOX.put(MEMORY_KEY, serializeMemory(mem));
+  await env.MAILBOX.put("config:card", JSON.stringify(cardFromMemory(mem)));
+  return mem;
 }
 
-async function saveCard(env, card) {
-  const { publicKey, keyId, ...persist } = card;
+async function writeMemory(env, card) {
+  const mem = memoryFromCard(card);
+  await env.MAILBOX.put(MEMORY_KEY, serializeMemory(mem));
+  // A derived copy, so anything still reading config:card sees the projection rather than a stale source.
+  const { publicKey, keyId, personaByTier, haveTier, witnesses, unparsed, ...persist } = card;
   await env.MAILBOX.put("config:card", JSON.stringify(persist));
 }
 
 // What HAAH adds to a plain A2A card. Lives in the extension's params, never at the top level.
-function haahParams(card, origin) {
-  const publicNeed = card.need.filter((n) => n.visibility === "public").map((n) => n.tag);
+// What a have is worth depends on who saw it. Every have carries its witnesses, and the person
+// themselves is one of them: an OWNER witness, the weakest kind, recorded when they confirm the
+// have out loud. Owner-attested haves are public and do reach the relay for now; a have with no
+// witness at all, not even the person, stays inside the portal.
+//
+// RELAY_REQUIRES_WITNESS=1 raises that bar: owner-only haves stop reaching the relay and travel no
+// further than tribe and inner. Default off; it flips in v0.6.0-trust.
+const OWNER_WITNESS = "owner";
+const witnessesOf = (card, tag) => ((card.witnesses || {})[tag] || []).filter(Boolean);
+const witnessedFor = (card, tag) => witnessesOf(card, tag);
+const corroboratedFor = (card, tag) => witnessesOf(card, tag).filter((w) => w !== OWNER_WITNESS);
+const relayNeedsWitness = (env) => !!(env && String(env.RELAY_REQUIRES_WITNESS || "") === "1");
+const haveAt = (card, tier) => (card.have || []).filter((t) => {
+  const own = (card.haveTier || {})[t] || "public";
+  if (TIER_ORDER.indexOf(own) > TIER_ORDER.indexOf(tier)) return false;   // held above the asker's tier
+  if (tier === "public") return own === "public" && witnessedFor(card, t).length > 0;
+  return true;
+});
+const needAt = (card, tier) => (card.need || []).filter((n) => {
+  if (n.visibility === "matched-only" || n.visibility === "directed") return false;  // never as text
+  return TIER_ORDER.indexOf(n.visibility) <= TIER_ORDER.indexOf(tier);
+}).map((n) => n.tag);
+
+function haahParams(card, origin, tier = "public") {
+  const need = needAt(card, tier);
+  const have = haveAt(card, tier);
   const glosses = {};
-  for (const t of [...publicNeed, ...card.have]) if (card.glosses && card.glosses[t]) glosses[t] = card.glosses[t];
-  return { handle: card.handle, cardUrl: `${origin}/card`, need: publicNeed, have: card.have, glosses, ...(card.publicKey ? { publicKey: card.publicKey, keyId: card.keyId } : {}) };
+  for (const t of [...need, ...have]) if (card.glosses && card.glosses[t]) glosses[t] = card.glosses[t];
+  return { handle: card.handle, cardUrl: `${origin}/card`, need, have, glosses, ...(card.publicKey ? { publicKey: card.publicKey, keyId: card.keyId } : {}) };
 }
 
 // The public document: an A2A v1.0 AgentCard. Mazel's fields ride in capabilities.extensions.
-function agentCard(card, origin, env) {
-  const haah = haahParams(card, origin);
+function agentCard(card, origin, env, tier = "public") {
+  const haah = haahParams(card, origin, tier);
   const streaming = !!(env && env.PULSE_STREAMING === "1");
   return {
     name: card.handle,
-    description: card.description || "",
+    description: (card.personaByTier || {})[tier] || card.description || "",
     supportedInterfaces: [{ url: `${origin}/a2a`, protocolBinding: "JSONRPC", protocolVersion: A2A_VERSION, tenant: "" }],
     provider: { organization: "Mazel", url: "https://mazel.ai" },
     version: PORTAL_VERSION,
@@ -167,17 +317,25 @@ function agentCard(card, origin, env) {
 }
 
 // Compatibility shim for internal callers that still want the flat Mazel view (handle, url, rpc, need, have).
-function publicCard(card, origin) {
-  const haah = haahParams(card, origin);
-  return { handle: haah.handle, description: card.description || "", url: haah.cardUrl, rpc: `${origin}/a2a`, need: haah.need, have: haah.have, glosses: haah.glosses };
+function publicCard(card, origin, tier = "public") {
+  const haah = haahParams(card, origin, tier);
+  const persona = (card.personaByTier || {})[tier] || card.description || "";
+  return { handle: haah.handle, description: persona, url: haah.cardUrl, rpc: `${origin}/a2a`, need: haah.need, have: haah.have, glosses: haah.glosses, ...(tier === "public" ? {} : { tier }) };
 }
 
 // Owner's full view: same as public plus the held (non-public) needs.
 function ownerCard(card, origin) {
+  const waiting = (card.have || []).filter((t) => ((card.haveTier || {})[t] || "public") === "public" && witnessesOf(card, t).length === 0);
+  const ownerOnly = (card.have || []).filter((t) => witnessesOf(card, t).length > 0 && corroboratedFor(card, t).length === 0);
   return {
     ...publicCard(card, origin),
     heldNeeds: card.need.filter((n) => n.visibility !== "public"),
+    heldHaves: (card.have || []).filter((t) => ((card.haveTier || {})[t] || "public") !== "public").map((t) => ({ tag: t, tier: (card.haveTier || {})[t] })),
+    ...(waiting.length ? { waitingOnAWitness: waiting, note: `These are on the card but nobody has corroborated them, so they stay inside the portal. Name a witness (a tool you read them from) and they go public.` } : {}),
+    witnesses: card.witnesses || {},
+    ...(ownerOnly.length ? { ownerAttestedOnly: ownerOnly, ownerNote: "Only the person vouches for these. They are public today; name a tool you saw them in and they stand on their own." } : {}),
     agentCard: `${origin}/.well-known/agent-card.json`,
+    memory: `${origin}/memory`,
   };
 }
 
@@ -213,12 +371,22 @@ function applyCardChange(card, args) {
   if (args.add_have) {
     const tags = tagList(args.add_have);
     if (!tags.length) throw new Error("add_have: empty tag");
+    const tier = FIELD_TIERS.includes(args.have_tier) ? args.have_tier : null;
+    const witnesses = (Array.isArray(args.witnesses) ? args.witnesses : String(args.witnesses || "").split(","))
+      .map((w) => String(w).trim().toLowerCase()).filter(Boolean).slice(0, 8);
+    next.haveTier = { ...(next.haveTier || {}) };
+    next.witnesses = { ...(next.witnesses || {}) };
     for (const tag of tags) {
       if (!next.have.includes(tag)) {
         if (next.have.length >= MAX_TAGS) throw new Error(`have already has ${MAX_TAGS} tags; remove one first`);
         next.have.push(tag);
       }
-      changes.push(`have + ${tag}`);
+      if (tier) next.haveTier[tag] = tier;
+      else if (!next.haveTier[tag]) next.haveTier[tag] = "public";
+      const attested = args.confirmed === true ? [OWNER_WITNESS] : [];
+      next.witnesses[tag] = [...new Set([...(next.witnesses[tag] || []), ...witnesses, ...attested])];
+      const seen = witnessesOf(next, tag);
+      changes.push(`have + ${tag}${seen.length ? ` (witnesses: ${seen.join(", ")})` : " (no witness yet, so it stays inside the portal)"}`);
     }
     publicChanged = true;
   }
@@ -514,6 +682,8 @@ const MCP_TOOLS = [
         need_visibility: { type: "string", enum: ["public", "matched-only", "directed"], description: "Visibility for add_need. Default public." },
         remove_need: { type: "string", description: "A Need tag to remove" },
         add_have: { type: ["string", "array"], items: { type: "string" }, description: "A Have tag to add, or several at once" },
+        witnesses: { type: ["string", "array"], items: { type: "string" }, description: "Where you saw this Have: the tools that corroborate it, like hubspot, gmail, calendar, drive. A Have with no witness stays inside the portal: it never goes on the open card and never reaches the relay." },
+        have_tier: { type: "string", enum: ["public", "tribe", "inner"], description: "How far this Have travels. Default public, which still needs a witness to leave." },
         remove_have: { type: "string", description: "A Have tag to remove" },
         gloss_tag: { type: "string", description: "Tag to set a one-line plain description for (helps other agents match)" },
         gloss_text: { type: "string", description: "The one-line description; empty clears it" },
@@ -644,6 +814,19 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: "my_memory",
+    description:
+      "MAZEL: read the file the card is projected from. The portal keeps a markdown memory file - personas, haves, needs, each with a tier (public, tribe, inner, matched-only, directed) and the witnesses that corroborate it. The card other people see is a projection of this file and never a source. Read it before editing anything, and show the person their own words when they ask what their portal knows about them.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "reveal_need",
+    description:
+      "MAZEL: the yes that lets a held-back need be said out loud. A need the person marked matched-only travels as a fingerprint, so a portal can line up with it without either side saying anything. When that happens their mailbox gets a blind.ask. Show them the words that would travel and who would hear them, get an explicit yes, then call this with confirmed: true. Until then nobody has been told anything.",
+    inputSchema: { type: "object", properties: { blind_id: { type: "string" }, confirmed: { type: "boolean" } }, required: ["blind_id"] },
+  },
+  {
     name: "claim_link",
     description:
       "MAZEL: the way to set up a portal when you cannot write. Some hosts give a connector read access only (ChatGPT does this on individual plans), so update_card is not callable. " +
@@ -655,6 +838,7 @@ const MCP_TOOLS = [
         handle: { type: "string", description: "Their handle, like lea@mazel" },
         persona: { type: "string", description: "Two or three plain sentences, in their register" },
         have: { type: ["string", "array"], items: { type: "string" }, description: "What they can offer someone: short lowercase hyphenated tags" },
+        witnesses: { type: ["string", "array"], items: { type: "string" }, description: "The tools you read these Haves from: hubspot, gmail, calendar, drive. A Have with no witness stays inside the portal." },
         need: { type: ["string", "array"], items: { type: "string" }, description: "What they are looking for: short lowercase hyphenated tags" },
         held_need: { type: ["string", "array"], items: { type: "string" }, description: "Needs they would not want strangers reaching them about. Held by the portal, never on the public card." },
       },
@@ -688,7 +872,12 @@ const FIRST_CONTACT = (origin) => [
   "1. Ask them one question: what handle do they want? A short name plus @mazel, like lea@mazel.",
   "   That is the only thing you ask them to supply.",
   "",
-  "2. Then draft their card yourself, by running this prompt on their behalf:",
+  "2. Then draft their card yourself. Read every tool you have: CRM, calendar, email, documents,",
+  "   and what you already remember about them. For each Have, record the witnesses that support",
+  "   it - the tools you actually saw it in - and pass them to update_card as witnesses. A Have",
+  "   nobody but the person has vouched for stays inside the portal: it never goes on the open card",
+  "   and never reaches the relay. Confirm before publishing anything.",
+  "   Run this prompt on their behalf:",
   "",
   "   > Draft my Mazel Agent Card.",
   "   >",
@@ -830,6 +1019,7 @@ async function callTool(name, args, env, origin) {
       handle,
       persona: String(args.persona || "").trim(),
       have: tagList(args.have || []),
+      witnesses: (Array.isArray(args.witnesses) ? args.witnesses : String(args.witnesses || "").split(",")).map((w) => String(w).trim().toLowerCase()).filter(Boolean).slice(0, 8),
       need: [
         ...tagList(args.need || []).map((tag) => ({ tag, visibility: "public" })),
         ...tagList(args.held_need || []).map((tag) => ({ tag, visibility: "matched-only" })),
@@ -849,6 +1039,32 @@ async function callTool(name, args, env, origin) {
     if (intro.state !== "proposed") throw new Error(`intro ${args.intro_id} is already ${intro.state}; nothing more to answer`);
     const link = await signedLink(env, origin, "/intro", { introId: String(args.intro_id), decision, note: String(args.note || "").slice(0, 500) });
     return `Show them who it is from and the why first, then give them this link. It shows the intro and one button that sends "${decision}". The link lasts ${LINK_MINUTES} minutes.\n\n${link}`;
+  }
+
+  if (name === "my_memory") {
+    await getCard(env);   // migrates an older portal into a file on first read
+    return await env.MAILBOX.get(MEMORY_KEY);
+  }
+
+  if (name === "reveal_need") {
+    const raw = await env.MAILBOX.get(`blind:${String(args.blind_id || "")}`);
+    if (!raw) throw new Error(`no blind match ${args.blind_id}; it may have expired`);
+    const b = JSON.parse(raw);
+    if (b.state !== "asked") return `Nothing sent. That one is already ${b.state}.`;
+    if (args.confirmed !== true) {
+      return `Not sent. This says your ask out loud to a portal you have never met: "${b.needText}". They lined up on ${b.overlap} signals and were told nothing else. Show the person those words, get a yes, then call again with confirmed: true.`;
+    }
+    const thread = JSON.parse((await env.MAILBOX.get(`thread:${b.threadId}`)) || "null");
+    if (!thread) throw new Error("that thread is gone");
+    const me = publicCard(await getCard(env), origin);
+    const core = await signedCast(env, origin, { type: "find.request", needId: thread.id, needText: thread.need_text, needTags: thread.tags, maxHops: 0, originRpc: `${origin}/a2a` });
+    const r = await deliver(env, origin, b.rpc, `${me.handle} is looking for ${thread.need_text}.`, { ...core, hops: 0, path: [me.handle] }, null);
+    b.state = r.ok ? "revealed" : "asked";
+    b.revealedAt = r.ok ? new Date().toISOString() : undefined;
+    await putObj(env, `blind:${b.id}`, b);
+    return r.ok
+      ? `Sent to ${b.rpc}. They now know what you are looking for, and nothing before this told them anything. If they fit, their answer lands in your mailbox as a candidate on the thread.`
+      : `NOT sent: ${r.reason}. Nothing was revealed. Try again later.`;
   }
 
   if (name === "update_card") {
@@ -1256,7 +1472,7 @@ const SIGNED_ENVELOPE = ["handle", "publicKey", "cardUrl", "rpc", "sig", "kid"];
 const ACTION_FIELDS = {
   "note": [],
   "find.request": [...SIGNED_ENVELOPE, "needId", "needText", "needTags", "maxHops", "originRpc", "castAt", "hops", "path"],
-  "find.hit": [...SIGNED_ENVELOPE, "needId", "needText", "needTags", "from", "matchedTags", "why", "via", "at", "castAt", "path"],
+  "find.hit": [...SIGNED_ENVELOPE, "needId", "needText", "needTags", "from", "matchedTags", "why", "via", "relay", "blind", "overlap", "at", "castAt", "path"],
   "intro.propose": [...SIGNED_ENVELOPE, "introId", "proposer", "why", "needText", "needTags", "matchedTags", "path"],
   "intro.respond": [...SIGNED_ENVELOPE, "introId", "decision", "note", "path"],
 };
@@ -1425,6 +1641,34 @@ async function listKnownCards(env) {
   return JSON.stringify(cards.map((c) => ({ handle: c.handle, url: c.url, rpc: c.rpc, have: c.have, need: c.need, tier: c.tier, addedAt: c.addedAt })), null, 2);
 }
 
+
+// ---- SHARED FP BEGIN (pure; lifted verbatim into the relay at build) ----
+// A fingerprint for a need the person does not want to say out loud. Each word becomes a short
+// prefix of its hash, so many words land in the same bucket and a bucket names none of them.
+//
+// What this protects: bulk harvesting, and a casual reader of the cache learning what someone is
+// looking for. What it does NOT protect: a targeted attacker with a dictionary and patience. The
+// prefix is short on purpose, so every bucket has company, but overlap across a whole set still
+// narrows things for someone who cares. It is obfuscation with a known cost, not secrecy. Real
+// private set intersection replaces it later; until then a matched-only need is safer than text
+// and not safe from someone hunting you specifically.
+const FP_PREFIX = 3;          // hex characters: 4096 buckets
+const FP_MATCH_MIN = 2;       // buckets that must line up before anyone is told anything
+
+async function fingerprint(words) {
+  const out = new Set();
+  for (const w of words) {
+    const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("mazel/fp/v1:" + w));
+    out.add([...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, FP_PREFIX));
+  }
+  return [...out].sort();
+}
+
+const fpOverlap = (a, b) => {
+  const set = new Set(a || []);
+  return (b || []).filter((x) => set.has(x)).length;
+};
+// ---- SHARED FP END ----
 
 // ---- SHARED MATCH BEGIN (pure functions; lifted verbatim into the relay at build; a test asserts equality) ----
 // Function words never count as a match. Two of these in common is not a fit.
@@ -1788,7 +2032,7 @@ async function listIntros(env) {
 }
 
 // ---------------------------------------------------------------------------
-// Fly: three carriers, all on, none owning anything. Known cards (crawl), the relay (a §25 cache),
+// Fly: three carriers, all on, none owning anything. Known cards (crawl), the relay (a §7.5 cache),
 // and one-hop gossip. Nostr is a fourth carrier behind CARRIER_NOSTR=1 with no implementation yet.
 // Only PUBLIC needs ever leave the portal on any carrier.
 
@@ -1815,16 +2059,37 @@ async function castNeed(env, origin, thread) {
   return relayPost(env, "/cast", await signedCast(env, origin, { kind: "need", visibility: "public", needId: thread.id, needText: thread.need_text, needTags: thread.tags }));
 }
 
+// A need the person is holding back still gets to travel, but only as buckets. No text, no tags,
+// nothing a reader of the cache can turn back into a sentence. A portal that looks like a fit is
+// told a bucket count and nothing else, and the person who owns the need decides whether any words
+// are ever said.
+async function castBlindNeed(env, origin, thread) {
+  const fp = await fingerprint(needWordsFor(thread.need_text, thread.tags));
+  return relayPost(env, "/cast", await signedCast(env, origin, { kind: "blind", visibility: "blind", needId: thread.id, fp }));
+}
+
+// What this portal is willing to put in a public cache. Same as the open card today; with
+// RELAY_REQUIRES_WITNESS on, an owner-only have is held back from strangers while staying on the
+// card for people who already hold it.
+function relayHaves(env, card, haah) {
+  if (!relayNeedsWitness(env)) return haah.have;
+  return haah.have.filter((t) => corroboratedFor(card, t).length > 0);
+}
+
 async function castCard(env, origin) {
   const card = await getCard(env);
   const haah = haahParams(card, origin);
-  return relayPost(env, "/cast", await signedCast(env, origin, { kind: "card", visibility: "public", have: haah.have, glosses: haah.glosses, description: card.description || "" }));
+  const have = relayHaves(env, card, haah);
+  return relayPost(env, "/cast", await signedCast(env, origin, { kind: "card", visibility: "public", have, glosses: haah.glosses, description: card.description || "" }));
 }
 
 async function subscribeRelay(env, origin) {
   const card = await getCard(env);
   const haah = haahParams(card, origin);
-  return relayPost(env, "/subscribe", await signedCast(env, origin, { config: { url: `${origin}/a2a`, taskId: "*", token: "" }, have: haah.have, glosses: haah.glosses, description: card.description || "" }));
+  // The have-side fingerprint, so a need nobody said out loud can still find this portal.
+  const have = relayHaves(env, card, haah);
+  const haveFp = await fingerprint(needWordsFor(card.description || "", have));
+  return relayPost(env, "/subscribe", await signedCast(env, origin, { config: { url: `${origin}/a2a`, taskId: "*" }, have, glosses: haah.glosses, haveFp, description: card.description || "" }));
 }
 
 async function publishRecord(env, origin) {
@@ -1945,6 +2210,29 @@ async function onFindRequest(env, origin, action, record) {
 
 // A hit arrives from the relay (signed by the relay) or from a gossiping portal (signed by it).
 // The stranger lands as a world-tier known card and as a candidate on the thread it answers.
+// The answer to a need the person is holding back. Nobody has said anything yet: a portal
+// somewhere lines up on enough buckets to be worth asking about. So this does not become a
+// candidate and does not become a known card. It becomes one question for the person, in private,
+// and their yes is what lets any words travel.
+async function onBlindHit(env, origin, action, record) {
+  const key = await hitKey(env, action);
+  if (!key || !(await verifyPayload(action, key))) return;
+  const raw = await env.MAILBOX.get(`thread:${action.needId}`);
+  if (!raw) return;
+  const thread = JSON.parse(raw);
+  if (thread.status !== "open") return;
+  const who = action.from || {};
+  if (!/^https:\/\//.test(String(who.rpc || ""))) return;
+  const id = await stableId("blind", action.needId, who.rpc);
+  if (await env.MAILBOX.get(`blind:${id}`)) return;           // asked once is enough
+  await putObj(env, `blind:${id}`, { id, threadId: thread.id, needText: thread.need_text, rpc: who.rpc, handle: who.handle || null, overlap: Number(action.overlap || 0), state: "asked", at: new Date().toISOString() });
+  await putObj(env, `msg:${Date.now()}:${id}`, {
+    id, from: "your own portal", text: `A portal lines up on ${action.overlap} signals with something you are holding back: "${thread.need_text}". Nothing has been said to them, and they were told nothing about it. Say yes and your ask goes to them in words; say no and nothing happens.`,
+    action: { type: "blind.ask", v: 1, blindId: id, threadId: thread.id, overlap: Number(action.overlap || 0) },
+    receivedAt: new Date().toISOString(),
+  });
+}
+
 // A hit is only worth reading if it was signed by a key this portal already trusted BEFORE the
 // message arrived: the relay it chose to subscribe to, or a card it already holds. A key carried
 // inside the message proves only that whoever wrote it can generate a keypair, and verifying
@@ -1979,6 +2267,7 @@ async function hitKey(env, action) {
 
 async function onFindHit(env, origin, action, record) {
   const who = action.from || {};
+  if (action.blind) return onBlindHit(env, origin, action, record);
   if (!who.handle || !who.cardUrl) return;
   if (!fresh(action.castAt)) return;
   const key = await hitKey(env, action);
@@ -2016,10 +2305,15 @@ async function runPulse(env, origin, how) {
   for (const t of await loadThreads(env)) {
     if (t.status !== "open") continue;
     const { key, ...thread } = t;
-    // Only public needs leave the portal.
+    // Only public needs leave the portal as words. A matched-only one still travels, but as
+    // buckets: no text, no tags, nothing a reader of the cache can turn back into a sentence.
     const card = await getCard(env);
-    const held = card.need.some((n) => n.visibility !== "public" && (thread.tags || []).includes(n.tag));
-    if (held) continue;
+    const heldTier = (card.need.find((n) => n.visibility !== "public" && (thread.tags || []).includes(n.tag)) || {}).visibility;
+    if (heldTier === "directed" || heldTier === "tribe" || heldTier === "inner") continue;
+    if (heldTier === "matched-only") {
+      if (carriers.relay) { await castBlindNeed(env, origin, thread); casts++; }
+      continue;
+    }
     const before = thread.candidates.length;
     if (carriers.relay) { await castNeed(env, origin, thread); casts++; }
     if (carriers.gossip) await gossipCast(env, origin, thread);
@@ -2143,9 +2437,9 @@ async function isClaimed(env) {
   // someone's: never show a setup link for it.
   const h = String(env.HANDLE || "").trim().toLowerCase();
   if (h && !UNCLAIMED_HANDLES.has(h)) return true;
-  const raw = await env.MAILBOX.get("config:card");
-  if (raw) {
-    const ch = String((JSON.parse(raw) || {}).handle || "").trim().toLowerCase();
+  const md = await env.MAILBOX.get(MEMORY_KEY);
+  if (md) {
+    const ch = (parseMemory(md).handle || "").trim().toLowerCase();
     if (ch && !UNCLAIMED_HANDLES.has(ch)) return true;
   }
   return false;
@@ -2181,6 +2475,19 @@ async function authorized(request, url, env) {
 
 // Public homepage. For a claimed portal: the card and the talk address, never the token, never a
 // connector URL. For one nobody has claimed yet: the setup link, for CLAIM_WINDOW_MIN minutes.
+// A peer proves who they are the same way everything else here does: they sign, and the signature
+// is checked against the key on the card this portal already holds for them. No new credential,
+// nothing stored, and a peer can never talk themselves up a tier they were not put at.
+async function tierForPull(env, handle, params) {
+  const exp = Number(params.get("e") || 0);
+  const sig = params.get("sig") || "";
+  if (!exp || !sig || Date.now() > exp) return null;
+  const card = (await knownCards(env)).find((c) => c.handle === String(handle).toLowerCase());
+  if (!card || !card.publicKey || card.tier === "world") return null;
+  const ok = await verifyPayload({ as: String(handle).toLowerCase(), e: exp, sig }, card.publicKey);
+  return ok ? card.tier : null;
+}
+
 async function handleRoot(env, origin) {
   const claimed = await isClaimed(env);
   const body = claimed
@@ -2196,7 +2503,7 @@ async function handleClaimLink(env, origin, draft, params, write) {
   if (!write) return linkPage("Your Mazel card", draftHtml(draft), "Save it and open my portal", params);
 
   let card = await getCard(env);
-  card = applyCardChange(card, { handle: draft.handle, persona: draft.persona, add_have: draft.have || [], confirmed: true }).card;
+  card = applyCardChange(card, { handle: draft.handle, persona: draft.persona, add_have: draft.have || [], witnesses: draft.witnesses || [], confirmed: true }).card;
   for (const n of draft.need || []) {
     card = applyCardChange(card, { add_need: n.tag, need_visibility: n.visibility, confirmed: true }).card;
   }

@@ -1,7 +1,7 @@
 {
   "v": 1,
   "handle": "ariel@mazel",
-  "publicKey": "DruFmjSPlBUtD1lnIHkLa8lL2kuAkk1Wjx1n55V5OpQ",
+  "publicKey": "1Yw0LGhpAiX_I5VUQGPTeqQqqbF8Z7xO6mHx3U02llM",
   "cardUrl": "https://mazel.fixture.workers.dev/.well-known/agent-card.json",
   "rpc": "https://mazel.fixture.workers.dev/a2a",
   "kind": "need",
@@ -13,5 +13,5 @@
     "atlantic-crossing"
   ],
   "sig": "<sig>",
-  "kid": "7ZP2EvlNpnBO9eGd"
+  "kid": "3BM-xvOvuo-0FTWr"
 }

@@ -36,9 +36,9 @@ ok('it carries the canonical card prompt, closer and all', /Two things: is anyth
 ok('it says where a sensitive need goes instead of the public card', /matched-only/.test(script) && /directed/.test(script));
 
 // 3. The claim: one call writes the whole card.
-const unconfirmed = await mcp(fresh, 'update_card', { handle:'lea@mazel', persona:'Lea builds biotech teams.', add_have:['biotech-recruiting','lab-ops'], add_need:'seed-investors' }, token);
+const unconfirmed = await mcp(fresh, 'update_card', { handle:'lea@mazel', persona:'Lea builds biotech teams.', add_have:['biotech-recruiting','lab-ops'], witnesses:['hubspot','gmail'], add_need:'seed-investors' }, token);
 ok('the draft is not written without a yes', /Not written/.test(unconfirmed), unconfirmed.slice(0,60));
-const claimed = await mcp(fresh, 'update_card', { handle:'lea@mazel', persona:'Lea builds biotech teams.', add_have:['biotech-recruiting','lab-ops'], add_need:'seed-investors', confirmed:true }, token);
+const claimed = await mcp(fresh, 'update_card', { handle:'lea@mazel', persona:'Lea builds biotech teams.', add_have:['biotech-recruiting','lab-ops'], witnesses:['hubspot','gmail'], add_need:'seed-investors', confirmed:true }, token);
 ok('one confirmed call claims the portal and writes the whole card', /This portal is lea@mazel from now on/.test(claimed), claimed.slice(0,90));
 const card = JSON.parse(await (await get(fresh, '/card')).text());
 const haah = card.capabilities.extensions.find(e => /haah/.test(e.uri)).params;
@@ -90,7 +90,7 @@ await get(gpt, '/');
 const gptToken = (await (await get(gpt, '/')).text()).match(/token=([a-f0-9]+)/)[1];
 await get(gpt, '/card');   // the signing key is minted lazily; mint it before measuring writes
 const kvBefore = gpt.MAILBOX.m.size;
-const linkOut = await mcp(gpt, 'claim_link', { handle:'lea@mazel', persona:'Lea builds biotech teams.', have:['biotech-recruiting','lab-ops'], need:'seed-investors', held_need:'quiet-cofounder-search' }, gptToken);
+const linkOut = await mcp(gpt, 'claim_link', { handle:'lea@mazel', persona:'Lea builds biotech teams.', have:['biotech-recruiting','lab-ops'], witnesses:['hubspot','gmail'], need:'seed-investors', held_need:'quiet-cofounder-search' }, gptToken);
 const claimUrl = (linkOut.match(/https:\/\/\S+\/claim\?\S+/) || [])[0];
 ok('claim_link hands back a link to the person own portal', !!claimUrl && claimUrl.startsWith(O + '/claim?'), linkOut.split('\n')[0]);
 ok('minting a link writes nothing, so a read-only host can do it', gpt.MAILBOX.m.size === kvBefore, `${kvBefore} -> ${gpt.MAILBOX.m.size}`);
