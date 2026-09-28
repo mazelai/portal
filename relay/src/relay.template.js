@@ -96,6 +96,16 @@ const MAX_GLOSSES = 12;
 const MAX_GLOSS_LEN = 200;
 const MAX_SUBS_PER_KEY = 3;
 const MAX_FANOUT = 50;
+// Per key, per day. MAX_FANOUT bounded one cast; nothing bounded how many casts, so one anonymous
+// key could keep the relay posting into every subscriber's mailbox all day at the operator's cost.
+const MAX_CASTS_PER_KEY_PER_DAY = 100;
+async function underCap(env, what, cap) {
+  const key = `cap:${what}:${new Date().toISOString().slice(0, 10)}`;
+  const n = Number((await env.RELAY.get(key)) || 0);
+  if (n >= cap) return false;
+  await env.RELAY.put(key, String(n + 1), { expirationTtl: 60 * 60 * 36 });
+  return true;
+}
 const capTags = (v) => (Array.isArray(v) ? v : []).map(normalizeTag).filter(Boolean).slice(0, MAX_TAGS_IN);
 const capGlosses = (g) => {
   const out = {};
@@ -235,6 +245,7 @@ async function cast(env, origin, body) {
     }
   }
   if (!fresh(body.castAt)) throw new Error("cast is missing a recent castAt; a cast with no time in its signature can be replayed forever");
+  if (!(await underCap(env, `cast:${body.publicKey.slice(0, 16)}`, MAX_CASTS_PER_KEY_PER_DAY))) throw new Error("that key has cast enough for one day here");
   // Keyed by the signing key, not by the handle. Keying by handle let anyone with a fresh keypair
   // overwrite the cached card of a handle they do not own, and every portal that searched picked up
   // their rpc for that person.
@@ -252,7 +263,9 @@ async function cast(env, origin, body) {
     description: String(body.description || "").slice(0, 600), tier: "world", castAt: new Date().toISOString(),
   };
   record.castAt = body.castAt;   // the signed time, not the time it happened to arrive
-  await put(env, `cast:${kind}:${id}`, record, CAST_TTL);
+  // A blind cast is a confirmation oracle for whoever holds it, so it is held for a day rather
+  // than a week: long enough to be matched, short enough not to be a standing question.
+  await put(env, `cast:${kind}:${id}`, record, kind === "blind" ? 60 * 60 * 24 : CAST_TTL);
   const notified = await notifySubscribers(env, origin, record);
   return json({ ok: true, id, kind, expiresInSeconds: CAST_TTL, notified, sentence: SENTENCE });
 }
@@ -341,7 +354,7 @@ async function notifyBlind(env, origin, castRecord) {
     if (s.publicKey === castRecord.publicKey) continue;
     const overlap = fpOverlap(castRecord.fp, s.haveFp || []);
     if (overlap < FP_MATCH_MIN) continue;
-    const hit = await relaySign(env, { v: 1, type: "find.hit", via: "relay", relay: origin, blind: true, needId: castRecord.needId, overlap, at: new Date().toISOString(), from: { handle: s.handle, cardUrl: s.url, rpc: s.url, publicKey: s.publicKey } });
+    const hit = await relaySign(env, { v: 1, type: "find.hit", via: "relay", relay: origin, blind: true, castAt: new Date().toISOString(), needId: castRecord.needId, overlap, at: new Date().toISOString(), from: { handle: s.handle, cardUrl: s.url, rpc: s.url, publicKey: s.publicKey } });
     const why = `A portal may fit something you are holding back: ${overlap} signals in common. Nothing was said about what you are looking for.`;
     try {
       const res = await fetch(castRecord.rpc, {
@@ -371,7 +384,7 @@ async function notifySubscribers(env, origin, castRecord) {
     const m = scoreCard(asCard, castRecord.needTags, needWords);
     if (m.score < 2 || !m.matched.length) continue;
     const hit = await relaySign(env, {
-      v: 1, type: "find.hit", via: "relay", relay: origin, needId: castRecord.needId, needText: castRecord.needText, needTags: castRecord.needTags,
+      v: 1, type: "find.hit", via: "relay", relay: origin, castAt: new Date().toISOString(), needId: castRecord.needId, needText: castRecord.needText, needTags: castRecord.needTags,
       from: { handle: castRecord.handle, cardUrl: castRecord.cardUrl, rpc: castRecord.rpc, publicKey: castRecord.publicKey },
       matchedTags: m.matched, why: `${castRecord.handle} is looking for ${castRecord.needText}; you have ${m.matched.join(", ")}.`, at: new Date().toISOString(),
     });

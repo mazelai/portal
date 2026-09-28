@@ -1,6 +1,6 @@
 {
   "name": "create-mazel",
-  "version": "0.4.2",
+  "version": "0.5.1",
   "description": "Open your Mazel portal, or update it, in one command. It asks you nothing.",
   "bin": {
     "create-mazel": "bin/create-mazel.js"

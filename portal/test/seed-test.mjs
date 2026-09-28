@@ -51,7 +51,7 @@ const signAs = async (env, payload) => {
 };
 const pull = async (as, env, tamper) => {
   const e = Date.now() + 60000;
-  const sig = await signAs(env, { as, e });
+  const sig = await signAs(env, { as, e, at: A });
   const u = `${A}/card?as=${encodeURIComponent(as)}&e=${e}&sig=${encodeURIComponent(tamper ? 'x'+sig.slice(1) : sig)}`;
   return worker.fetch(new Request(u), portals[A]);
 };
@@ -75,8 +75,21 @@ const wire = seen.slice(before).map(x => x.url + ' ' + x.body).join('\n');
 const fromA = seen.slice(before).filter(x => /ariel@mazel/.test(x.body || '')).map(x => x.url + ' ' + x.body).join('\n');
 ok('the words of a held-back need appear on no wire this portal wrote', !/quiet cofounder search/i.test(fromA), (fromA.match(/.{0,50}cofounder.{0,30}/) || [''])[0]);
 ok('nor does its tag', !/quiet-cofounder-search/.test(wire), (wire.match(/.{0,40}quiet.{0,40}/) || [''])[0]);
-const casts = [...renv.RELAY.m.entries()].filter(([k]) => k.startsWith('cast:blind:'));
-ok('what the cache holds is buckets and an id', casts.length === 1 && JSON.parse(casts[0][1]).fp.length > 0 && !JSON.stringify(JSON.parse(casts[0][1])).includes('cofounder'), casts.length ? JSON.stringify(JSON.parse(casts[0][1]).fp).slice(0,60) : 'none');
+// By default a held-back need does not reach the public cache at all: an unkeyed fingerprint lets
+// whoever holds it confirm a guess, so it goes only to cards the person already holds.
+ok('a held-back need does not reach the public cache by default', [...renv.RELAY.m.keys()].filter(k => k.startsWith('cast:blind:')).length === 0);
+{
+  const loud = { ...portals[A], BLIND_TO_RELAY: '1' };
+  await worker.fetch(new Request(A+'/mcp?token=ta', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:'pulse', arguments:{} } }) }), loud);
+  const casts = [...renv.RELAY.m.entries()].filter(([k]) => k.startsWith('cast:blind:'));
+  ok('with BLIND_TO_RELAY on it does, and what the cache holds is buckets and an id', casts.length === 1 && JSON.parse(casts[0][1]).fp.length > 0 && !JSON.stringify(JSON.parse(casts[0][1])).includes('cofounder'), casts.length ? JSON.stringify(JSON.parse(casts[0][1]).fp).slice(0,60) : 'none');
+}
+
+// The circle that already knows them can answer, without the cache ever being involved.
+{
+  const box = await call(A, 'check_mailbox');
+  ok('a card the person holds can answer a held-back need directly', box.startsWith('{') && JSON.parse(box).messages.some(m => (m.action || {}).type === 'find.hit' && m.action.blind), box.slice(0, 70));
+}
 
 // ---- and the person decides whether any words are ever said ----
 const boxRaw = await call(A, 'check_mailbox');

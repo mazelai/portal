@@ -61,21 +61,25 @@ const routed = await call(B, 'route_ghost', { ask_id: askB.action.askId, confirm
 ok('yes gives the owner words to send, and makes them the router', /Your yes is recorded/.test(routed) && /router/.test(routed), routed.slice(0, 70));
 ok('even then the portal sends nothing on their behalf', !wireLog.slice(mark).join('\n').includes('Dana Reyes'));
 
-// ---- resolution through a bucket, local and opt-in ----
+// ---- resolution happens because a person said so, never because of a published identifier ----
 {
   await call(B, 'note_ghost', { name:'Ariel Jalali', org:'paragoncto.com', email:'ariel@paragoncto.com', have:['managed-ai-delivery'], role:'Runs Paragon', witnesses:['gmail'], edge_score: 70 });
-  const beforeLink = JSON.parse(await call(B, 'list_ghosts', { q:'ariel' })).ghosts[0];
-  ok('a ghost starts unresolved', !beforeLink.resolvedTo);
-  await call(A, 'pulse');                                  // A publishes a record carrying its bucket
+  const before = JSON.parse(await call(B, 'list_ghosts', { q:'ariel' })).ghosts[0];
+  ok('a ghost starts unresolved', !before.resolvedTo);
+  await call(A, 'pulse');
   await call(B, 'resolve_handle', { handle: 'ariel@mazel' });
-  const after = JSON.parse(await call(B, 'list_ghosts', { q:'ariel' })).ghosts[0];
-  ok('a ghost in the same bucket as a published record becomes an edge to that card', after.resolvedTo === 'ariel@mazel', String(after.resolvedTo));
-  ok('what is published is a bucket, not an address', !/paragoncto\.com/.test(JSON.stringify([...renv.RELAY.m.values()])) , 'address found in the cache');
+  const stillGhost = JSON.parse(await call(B, 'list_ghosts', { q:'ariel' })).ghosts[0];
+  ok('holding their card does not silently resolve a ghost to it', !stillGhost.resolvedTo, String(stillGhost.resolvedTo));
+  ok('no address, and no hash of one, is stored on a ghost', !JSON.stringify(stillGhost).includes('paragoncto.com') || !stillGhost.emailBucket, JSON.stringify(stillGhost).slice(0, 90));
   const rec = JSON.parse([...renv.RELAY.m.entries()].find(([k]) => k.startsWith('dir:ariel'))[1]);
-  ok('and the bucket is short enough to be shared', typeof rec.emailBucket === 'string' && rec.emailBucket.length === 3, String(rec.emailBucket));
-  const noOptIn = { ...portals[B], OWNER_EMAIL: undefined };
-  const card = JSON.parse(await (await worker.fetch(new Request(B + '/.well-known/mazel/lea.json'), noOptIn)).text());
-  ok('no opt-in, no bucket', !card.emailBucket);
+  ok('a published record carries no email identifier at all', !rec.emailBucket && !JSON.stringify(rec).includes('paragoncto'), JSON.stringify(Object.keys(rec)));
+  const linked = await call(B, 'link_ghost', { ghost_id: before.id, handle_or_url: 'ariel@mazel' });
+  ok('the person can say the two are the same, and then they are', /is ariel@mazel from now on/.test(linked), linked.slice(0, 70));
+  ok('and the ghost is resolved', JSON.parse(await call(B, 'list_ghosts', { q:'ariel' })).ghosts[0].resolvedTo === 'ariel@mazel');
+  let refused = '';
+  try { await call(B, 'link_ghost', { ghost_id: before.id, handle_or_url: 'nobody@mazel' }); } catch (e) { refused = String(e.message); }
+  const said = refused || await call(B, 'link_ghost', { ghost_id: before.id, handle_or_url: 'nobody@mazel' });
+  ok('and only to a card this portal actually holds', /holds no card/.test(said), said.slice(0, 70));
 }
 
 // ---- the thing this whole suite exists to check ----
