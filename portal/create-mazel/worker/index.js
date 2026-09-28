@@ -112,7 +112,7 @@ export default {
 // visibility: "public" (on /card), "matched-only" or "directed" (held by the portal, never on /card).
 // THE version. Everything else is derived from this line: the relay is stamped from it at
 // build, and a suite test fails if any package.json or the VERSION file disagrees.
-const PORTAL_VERSION = "0.5.1";
+const PORTAL_VERSION = "0.5.2";
 const A2A_VERSION = "1.0";
 const HAAH_URI = "https://mazel.ai/ext/haah/v1";
 const DEFAULT_RELAY = "https://relay.mazel-peer.workers.dev";
