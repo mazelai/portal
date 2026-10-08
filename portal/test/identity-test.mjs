@@ -1,11 +1,13 @@
 // Identity: keys, canonical signing, handle records, resolution, rotation. Two in-process portals,
 // one acting as a directory for its own name; fetch routed in-process.
-import worker from '../src/index.js';
+import rawWorker from '../src/index.js';
+import { legacy as legacyWorker } from './a2a-helpers.mjs';
+const worker = legacyWorker(rawWorker);
 import { flat, HAAH } from './a2a-helpers.mjs';
 const mkKV = () => { const m = new Map(); return { m, get: async k => m.get(k) ?? null, put: async (k,v) => m.set(k,v), delete: async k => m.delete(k), list: async ({prefix}) => ({ keys: [...m.keys()].filter(k=>k.startsWith(prefix)).map(name=>({name})) }) }; };
 const A='https://mazel.a.workers.dev', B='https://example.com';
 const portals = {
-  [A]: { HANDLE:'ariel@mazel', PERSONA:'p', NEED:'', HAVE:'managed-ai-delivery', INBOX_TOKEN:'ta', MAILBOX: mkKV(), RELAY_URL: 'https://relay.test' },
+  [A]: { HANDLE:'avery@mazel', PERSONA:'p', NEED:'', HAVE:'managed-ai-delivery', INBOX_TOKEN:'ta', MAILBOX: mkKV(), RELAY_URL: 'https://relay.test' },
   [B]: { HANDLE:'lea@example.com', PERSONA:'Lea', NEED:'', HAVE:'biotech-vc', INBOX_TOKEN:'tb', MAILBOX: mkKV(), RELAY_URL: 'https://relay.test' },
 };
 const relayStore = new Map(); // relay stub: /publish stores records; /.well-known/mazel/<name>.json serves them
@@ -54,12 +56,12 @@ globalThis.fetch = origFetch;
 
 // name@mazel resolves through the relay directory after the portal publishes
 await call(A,'rotate_key',{confirmed:true}); // also publishes; but first make sure a plain publish path exists via rotation
-const dir = relayStore.get('ariel');
-ok('rotation published a handle record to the directory', !!dir && dir.handle==='ariel@mazel' && dir.rotations.length===1);
+const dir = relayStore.get('avery');
+ok('rotation published a handle record to the directory', !!dir && dir.handle==='avery@mazel' && dir.rotations.length===1);
 const idA2 = JSON.parse(await call(A,'my_identity'));
-ok('rotation changed the key and kept the handle', idA2.publicKey!==idA.publicKey && idA2.handle==='ariel@mazel' && idA2.rotations===1);
-t = await call(B,'resolve_handle',{handle:'ariel@mazel'});
-ok('name@mazel resolves via the directory with the NEW key', t.startsWith('Resolved ariel@mazel') && /1 rotation/.test(t), t.slice(0,100));
+ok('rotation changed the key and kept the handle', idA2.publicKey!==idA.publicKey && idA2.handle==='avery@mazel' && idA2.rotations===1);
+t = await call(B,'resolve_handle',{handle:'avery@mazel'});
+ok('name@mazel resolves via the directory with the NEW key', t.startsWith('Resolved avery@mazel') && /1 rotation/.test(t), t.slice(0,100));
 
 // rotation chain verifies old -> new
 const r = dir.rotations[0];
@@ -73,6 +75,6 @@ ok('find works after rotation and still sees known cards', f.candidates.some(c=>
 await call(A,'rotate_key',{confirmed:true});
 const lt = JSON.parse(await call(A,'list_threads')).find(x=>x.thread_id===f.thread_id);
 ok('thread survives a second rotation', !!lt && lt.status==='open' && lt.candidates.length===1);
-ok('directory now holds a 2-link chain', relayStore.get('ariel').rotations.length===2);
+ok('directory now holds a 2-link chain', relayStore.get('avery').rotations.length===2);
 console.log(`\nidentity: ${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

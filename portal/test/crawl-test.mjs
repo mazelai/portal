@@ -1,24 +1,35 @@
-import worker from '../src/index.js';
+import rawWorker from '../src/index.js';
+import { legacy as legacyWorker } from './a2a-helpers.mjs';
+const worker = legacyWorker(rawWorker);
 import { sendReq, flat, ackText } from './a2a-helpers.mjs';
 const mkKV = () => { const m = new Map(); return { m, get: async k => m.get(k) ?? null, put: async (k,v) => m.set(k,v), delete: async k => m.delete(k), list: async ({prefix}) => ({ keys: [...m.keys()].filter(k=>k.startsWith(prefix)).map(name=>({name})) }) }; };
 const portals = {
-  'https://mazel.ariel-mazel.workers.dev': { env: { HANDLE:'ariel@mazel', PERSONA:'Ariel runs Paragon.', NEED:'tech-advisor-partners', HAVE:'managed-ai-delivery', INBOX_TOKEN:'tokA', MAILBOX: mkKV() } },
+  'https://mazel.avery-mazel.workers.dev': { env: { HANDLE:'avery@mazel', PERSONA:'Avery runs Halcyon.', NEED:'tech-advisor-partners', HAVE:'managed-ai-delivery', INBOX_TOKEN:'tokA', MAILBOX: mkKV() } },
   'https://mazel.gary-mazel.workers.dev':  { env: { HANDLE:'gary@mazel', PERSONA:'Gary lives in Tokyo and runs a small design studio.', NEED:'design-clients', HAVE:'hockey,ux-design', INBOX_TOKEN:'tokG', MAILBOX: mkKV() } },
   'https://mazel.lea-mazel.workers.dev':   { env: { HANDLE:'lea@mazel', PERSONA:'Lea is a biotech VC in Boston.', NEED:'deal-flow', HAVE:'biotech-vc', INBOX_TOKEN:'tokL', MAILBOX: mkKV() } },
 };
 let offline = new Set();
 const realFetch = globalThis.fetch;
+// The directory: name@mazel resolves at the relay, which serves the record each portal publishes.
+// Since 28c H1/H2 a proposal from a portal this one does not hold is checked against that record.
+const RELAY = 'https://relay.crawl';
 globalThis.fetch = async (url, init={}) => {
   const u = new URL(url); const o = u.origin;
+  if (o === RELAY) {
+    const m = u.pathname.match(/^\/\.well-known\/mazel\/([a-z0-9._-]+)\.json$/);
+    if (m) { const who = Object.entries(portals).find(([, p]) => (p.env.HANDLE || '').toLowerCase() === m[1] + '@mazel'); return who ? worker.fetch(new Request(who[0] + u.pathname), who[1].env) : new Response('{"error":"no such handle"}', { status: 404 }); }
+    return new Response(JSON.stringify({ ok: true, hits: [], results: [] }), { headers: { 'content-type': 'application/json' } });
+  }
   if (offline.has(o)) return new Response('Service Unavailable', { status: 503 });
   if (portals[o]) return worker.fetch(new Request(url, init), portals[o].env);
   return new Response('harness: no network', { status: 503 }); // suites never touch the real relay or peers
 };
+for (const p of Object.values(portals)) if (!p.env.RELAY_URL) p.env.RELAY_URL = RELAY;
 const call = async (origin, name, args) => {
   const r = await worker.fetch(new Request(origin+'/mcp', { method:'POST', headers:{ 'content-type':'application/json', authorization:'Bearer '+portals[origin].env.INBOX_TOKEN }, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name, arguments: args||{} } }) }), portals[origin].env);
   return JSON.parse(await r.text()).result.content[0].text;
 };
-const A='https://mazel.ariel-mazel.workers.dev', G='https://mazel.gary-mazel.workers.dev', L='https://mazel.lea-mazel.workers.dev';
+const A='https://mazel.avery-mazel.workers.dev', G='https://mazel.gary-mazel.workers.dev', L='https://mazel.lea-mazel.workers.dev';
 let pass=0, fail=0; const ok=(l,c,x='')=>{ console.log((c?'PASS ':'FAIL ')+l+(x?'  -> '+x.replace(/\n/g,' ').slice(0,150):'')); c?pass++:fail++; };
 
 // glosses on Gary's card
@@ -29,7 +40,7 @@ ok('gloss on public card', gcard.glosses && gcard.glosses.hockey.includes('Tokyo
 // trade cards
 let t = await call(A,'add_known_card',{url:G+'/card'}); ok('add Gary', t.startsWith('Added known card gary@mazel'), t);
 t = await call(A,'add_known_card',{url:L+'/card'}); ok('add Lea', t.startsWith('Added'));
-t = await call(G,'add_known_card',{url:A+'/card'}); ok('Gary adds Ariel', t.startsWith('Added'));
+t = await call(G,'add_known_card',{url:A+'/card'}); ok('Gary adds Avery', t.startsWith('Added'));
 const kc = JSON.parse(await call(A,'list_known_cards')); ok('tier defaulted to tribe, never asked', kc.every(c=>c.tier==='tribe'));
 t = await call(A,'add_known_card',{url:G+'/card'}); ok('re-add refreshes, no duplicate', t.startsWith('Refreshed') && JSON.parse(await call(A,'list_known_cards')).length===2);
 portals['https://mazel.gary2-mazel.workers.dev']={env:{...portals[G].env}};
@@ -40,25 +51,26 @@ t = await call(A,'remove_known_card',{handle_or_url:'lea@mazel'}); ok('remove_kn
 await call(A,'add_known_card',{url:L+'/card'});
 
 // HOCKEY TEST
+await call(A,'update_card',{add_need:'hockey', confirmed:true});   // a proposal carries the need's words
 t = await call(A,'find',{need_text:'a hockey player in Tokyo', tags:['hockey','tokyo']});
 const f = JSON.parse(t);
 ok('find ranks Gary first with why', f.candidates[0].handle==='gary@mazel' && f.candidates[0].why.includes('hockey'), f.candidates[0].why);
 ok('Lea not a candidate (no fit)', !f.candidates.some(c=>c.handle==='lea@mazel'));
 const TH=f.thread_id;
 t = await call(A,'propose_intro',{thread_id:TH, card_url:G+'/card'}); ok('propose without confirm -> not sent', t.startsWith('Not sent'));
-t = await call(A,'propose_intro',{thread_id:TH, card_url:G+'/card', confirmed:true}); ok('propose confirmed -> delivered to Gary', t.startsWith('Delivered intro'), t);
+t = await call(A,'propose_intro',{thread_id:TH, card_url:G+'/card', confirmed:true}); ok('propose confirmed -> delivered to Gary', t.startsWith('Proposed to gary@mazel'), t);
 const gin = JSON.parse(await call(G,'check_mailbox'));
 const prop = gin.messages.find(m=>m.action && m.action.type==='intro.propose');
-ok("Gary's mailbox has intro.propose with why + path", !!prop && prop.action.path[0]==='ariel@mazel' && prop.action.why.includes('hockey'), prop && prop.text);
+ok("Gary's mailbox has intro.propose with why + path", !!prop && prop.action.path[0]==='avery@mazel' && prop.action.why.includes('hockey'), prop && prop.text);
 const gIntros = JSON.parse(await call(G,'list_intros')); ok("Gary's portal created intro object (received, proposed)", gIntros[0].direction==='received' && gIntros[0].state==='proposed');
 ok('both portals agree after the accept (checked after the flip below)', true);
 const ID = prop.action.introId;
-t = await call(G,'respond_intro',{intro_id:ID, decision:'accepted', note:'Sure, Tuesdays.', confirmed:true}); ok('Gary accepts -> connected, crossing marked', t.startsWith('🌀') && t.includes('connected'), t);
+t = await call(G,'respond_intro',{intro_id:ID, decision:'accepted', note:'Sure, Tuesdays.', confirmed:true}); ok('Gary accepts -> connected, crossing marked', t.startsWith('🌀') && t.includes('both said yes'), t);
 { const g=JSON.parse(await call(G,'list_intros')).find(i=>i.intro_id===ID), a=JSON.parse(await call(A,'list_intros')).find(i=>i.intro_id===ID);
   ok('both portals hold agreeing copies', g.state===a.state && g.state==='connected' && g.their_answer==='accepted' && a.their_answer==='accepted' && !!g.connected_at && !!a.connected_at, JSON.stringify({g:g.state,a:a.state}));
   ok('answering twice is refused', (await call(G,'respond_intro',{intro_id:ID, decision:'declined', confirmed:true})).includes('already connected')); }
-const aIntros = JSON.parse(await call(A,'list_intros')); ok("Ariel's intro flipped from the wire: connected (unanimous yes)", aIntros[0].state==='connected' && aIntros[0].their_answer==='accepted' && aIntros[0].path[0]==='ariel@mazel');
-const ain = JSON.parse(await call(A,'check_mailbox')); ok("Ariel's mailbox has intro.respond text", ain.messages.some(m=>m.action.type==='intro.respond' && m.text.includes('accepted')));
+const aIntros = JSON.parse(await call(A,'list_intros')); ok("Avery's intro flipped from the wire: connected (unanimous yes)", aIntros[0].state==='connected' && aIntros[0].their_answer==='accepted' && aIntros[0].path[0]==='avery@mazel');
+const ain = JSON.parse(await call(A,'check_mailbox')); ok("Avery's mailbox has intro.respond text", ain.messages.some(m=>m.action.type==='intro.respond' && m.text.includes('accepted')));
 ok('thread candidate shows connected', JSON.parse(await call(A,'list_threads')).find(t=>t.thread_id===TH).candidates[0].intro_state==='connected');
 { // the thread's cached hint must never outrank the intro object
   const key='thread:'+TH, th=JSON.parse(portals[A].env.MAILBOX.m.get(key));
@@ -72,18 +84,19 @@ ok('no match -> nothing fits + closest partial, still JSON', JSON.parse(t).headl
 t = await call(A,'find',{need_text:'someone who does design for apps', tags:['app-design']});
 ok('partial: design matches via ux-design word overlap', JSON.parse(t).candidates.some(c=>c.handle==='gary@mazel'), t);
 // FAILURE 2: declined intro closes cleanly
+await call(A,'update_card',{add_need:'biotech-vc', confirmed:true});   // a proposal carries the need's words
 t = await call(A,'find',{need_text:'biotech investor', tags:['biotech-vc']}); const f2=JSON.parse(t);
 await call(A,'propose_intro',{thread_id:f2.thread_id, card_url:L+'/card', confirmed:true});
 const lin = JSON.parse(await call(L,'check_mailbox')); const lid = lin.messages.find(m=>m.action.type==='intro.propose').action.introId;
 t = await call(L,'respond_intro',{intro_id:lid, decision:'declined', note:'Not now.', confirmed:true}); ok('decline delivered, closes cleanly', t.toLowerCase().includes('closed cleanly'));
-ok("Ariel's intro = declined; thread still open", JSON.parse(await call(A,'list_intros')).find(i=>i.intro_id===lid).state==='declined' && JSON.parse(await call(A,'list_threads')).find(x=>x.thread_id===f2.thread_id).status==='open');
+ok("Avery's intro = declined; thread still open", JSON.parse(await call(A,'list_intros')).find(i=>i.intro_id===lid).state==='declined' && JSON.parse(await call(A,'list_threads')).find(x=>x.thread_id===f2.thread_id).status==='open');
 // FAILURE 3: offline portal -> kept, retry same id
 offline.add(L);
 t = await call(A,'find',{need_text:'biotech deal flow help', tags:['biotech-vc','deal-flow']}); const f3=JSON.parse(t);
-t = await call(A,'propose_intro',{thread_id:f3.thread_id, card_url:L+'/card', confirmed:true}); ok('offline -> NOT delivered, intro saved', t.startsWith('NOT delivered') && t.includes('retry'), t);
+t = await call(A,'propose_intro',{thread_id:f3.thread_id, card_url:L+'/card', confirmed:true}); ok('offline -> queued, retried with backoff, intro saved', /could not be reached/.test(t) && /queued and will be retried/.test(t), t);
 const pend = JSON.parse(await call(A,'list_intros')).find(i=>i.state==='proposed' && i.delivered===false); ok('intro object kept with error', !!pend && !!pend.error);
 offline.delete(L);
-t = await call(A,'propose_intro',{thread_id:f3.thread_id, card_url:L+'/card', confirmed:true}); ok('retry after back online -> delivered', t.startsWith('Delivered intro'));
+t = await call(A,'propose_intro',{thread_id:f3.thread_id, card_url:L+'/card', confirmed:true}); ok('retry after back online -> delivered', t.startsWith('Proposed to'), t);
 t = await call(A,'propose_intro',{thread_id:f3.thread_id, card_url:L+'/card', confirmed:true}); ok('re-propose after delivery -> nothing sent, waiting on answer', t.startsWith('Nothing sent') && t.includes('waiting on their answer'), t);
 { const lid2 = JSON.parse(await call(L,'list_intros')).find(i=>i.state==='proposed').intro_id; await call(L,'respond_intro',{intro_id:lid2, decision:'declined', confirmed:true});
   t = await call(A,'propose_intro',{thread_id:f3.thread_id, card_url:L+'/card', confirmed:true}); ok('re-propose after an answer -> refuses, keeps outcome', t.startsWith('Nothing sent') && t.includes('already answered'), t);
@@ -107,7 +120,7 @@ const f6=JSON.parse(await call(A,'find',{need_text:'hockey', tags:['hockey']}));
   portals['https://mazel.newsailor.workers.dev']={env:{HANDLE:'newsailor@mazel',PERSONA:'Sails oceans.',NEED:'',HAVE:'sailing-atlantic',INBOX_TOKEN:'t',MAILBOX:mkKV()}};
   await call('https://mazel.newsailor.workers.dev','update_card',{gloss_tag:'sailing-atlantic',gloss_text:'has sailed across the Atlantic twice',confirmed:true});
   const add = await call(A,'add_known_card',{url:'https://mazel.newsailor.workers.dev/card'});
-  ok('adding a card later grows the open thread, no recast', add.includes('need you already cast') && add.includes(th), add.slice(0,120));
+  ok('adding a card later grows the open thread, no recast', add.includes('need you already cast') && add.includes('someone who sails oceans') && !add.includes(th), add.slice(0,120));
   const lt = JSON.parse(await call(A,'list_threads')).find(t=>t.thread_id===th);
   ok('thread now lists the new candidate with its why', lt.candidates.some(c=>c.handle==='newsailor@mazel' && /sail/i.test(c.why)));
   ok('list_threads shows why + room left', typeof lt.room==='number' && lt.candidates.every(c=>c.why));

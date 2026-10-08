@@ -19,10 +19,27 @@ import { spawn } from "node:child_process";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(HERE, "..", "worker", "index.js");
-const API = env.MAZEL_API_BASE || "https://api.cloudflare.com/client/v4";
+// The endpoint overrides exist for the suite, which stands up a fake Cloudflare on 127.0.0.1.
+// They are pinned to the loopback: every cf() call carries a live Cloudflare token, and without
+// this pin anything that could set one environment variable could redirect that token to a host
+// of its choosing.
+const loopbackOnly = (v, fallback) => {
+  if (!v) return fallback;
+  try {
+    const h = new URL(v).hostname;
+    if (h === "127.0.0.1" || h === "localhost" || h === "::1") return v;
+  } catch { /* fall through */ }
+  stdout.write(`  Ignoring ${v}: test endpoints must be on this machine.\n`);
+  return fallback;
+};
+const API = loopbackOnly(env.MAZEL_API_BASE, "https://api.cloudflare.com/client/v4");
 const flag = (n) => argv.includes(`--${n}`);
 const opt = (n, d) => { const i = argv.indexOf(`--${n}`); return i > -1 && argv[i + 1] ? argv[i + 1] : d; };
 const YES = flag("yes"), DRY = flag("dry-run"), ROTATE = flag("rotate-key");
+// --store do moves an existing portal onto the storage object; --store kv brings it back. It is
+// the only thing that changes where a portal keeps its state, and it is deliberately separate from
+// an ordinary update, because the copy and the verify come first (migrate_store).
+const STORE = opt("store", "");
 const NAME = opt("name", "mazel");
 const DEFAULT_RELAY = "https://relay.mazel-peer.workers.dev";
 const RELAY = opt("relay", env.MAZEL_RELAY_URL || DEFAULT_RELAY);
@@ -65,8 +82,8 @@ async function cf(token, path, init = {}) {
 // the whole sign-in for real; nothing but the tests ever sets them.
 const OAUTH = {
   client: "54d11594-84e4-41aa-b438-e81b8fa78ee7",
-  auth: env.MAZEL_OAUTH_AUTH || "https://dash.cloudflare.com/oauth2/auth",
-  token: env.MAZEL_OAUTH_TOKEN || "https://dash.cloudflare.com/oauth2/token",
+  auth: loopbackOnly(env.MAZEL_OAUTH_AUTH, "https://dash.cloudflare.com/oauth2/auth"),
+  token: loopbackOnly(env.MAZEL_OAUTH_TOKEN, "https://dash.cloudflare.com/oauth2/token"),
   port: Number(env.MAZEL_OAUTH_PORT || 8976),
   scopes: ["account:read", "user:read", "workers:write", "workers_kv:write", "workers_scripts:write", "workers_routes:write", "offline_access"],
 };
@@ -200,6 +217,11 @@ async function main() {
   //    set up the old way (HANDLE/PERSONA/NEED/HAVE vars) keeps them and nothing is re-typed.
   const code = readFileSync(WORKER, "utf8");
   const bindings = [{ type: "kv_namespace", name: "MAILBOX", namespace_id: ns.id }];
+  // The storage object. Every portal gets the binding and the class, on the SQLite backend, which
+  // runs on Workers Free: 100,000 rows written a day against KV's 1,000 writes, and 2 MB a value
+  // against 128 KiB. The KV namespace stays bound either way, because the published card lives
+  // there and because a portal that has not been migrated still reads and writes KV.
+  bindings.push({ type: "durable_object_namespace", name: "PORTAL", class_name: "Portal" });
   // Set fresh every time: inherit cannot add a var a portal lacks, and PORTAL_ORIGIN is what lets
   // the scheduled pulse know its own address, since a cron run has no request to read it from.
   bindings.push({ type: "plain_text", name: "RELAY_URL", text: RELAY });
@@ -208,6 +230,7 @@ async function main() {
   if (updating) {
     const settings = await cf(token, `/accounts/${acc}/workers/scripts/${NAME}/settings`).catch(() => ({ bindings: [] }));
     const mine = new Set(["MAILBOX", "RELAY_URL", "PORTAL_ORIGIN"]);
+    if (STORE) mine.add("STORE");          // --store is the one thing that overrides what it carries
     for (const b of settings.bindings || []) {
       if (mine.has(b.name)) continue;
       if (ROTATE && b.name === "INBOX_TOKEN") continue;
@@ -218,16 +241,40 @@ async function main() {
       inboxToken = env.MAZEL_TOKEN || randomBytes(32).toString("hex");
       bindings.push({ type: "secret_text", name: "INBOX_TOKEN", text: inboxToken });
     }
+    if (STORE === "do") {
+      bindings.push({ type: "plain_text", name: "STORE", text: "do" });
+      say("  Storage: this portal will read and write its storage object from this deploy on. Its KV copy is left exactly as it is.");
+    } else if (STORE === "kv") {
+      say("  Storage: this portal goes back to KV from this deploy on. Anything written to the object since the move is only in the object; copy it back first with migrate_store direction to-kv.");
+    } else if (STORE) {
+      die(`--store takes do or kv, not ${STORE}`);
+    }
+    // STORE is deliberately not in `mine` unless --store said so: a portal already migrated keeps
+    // STORE=do by inheriting it, and one still on KV keeps nothing, so an ordinary update never
+    // moves anybody's storage.
   } else {
     inboxToken = env.MAZEL_TOKEN || randomBytes(32).toString("hex");
     bindings.push({ type: "secret_text", name: "INBOX_TOKEN", text: inboxToken });
+    // A new portal has nothing to migrate, so it starts in the object and never touches the KV
+    // write ceiling. An existing portal is left where it is.
+    bindings.push({ type: "plain_text", name: "STORE", text: "do" });
   }
-  const metadata = { main_module: "index.js", compatibility_date: "2026-01-01", bindings };
-  const form = new FormData();
-  form.set("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-  form.set("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
-  await cf(token, `/accounts/${acc}/workers/scripts/${NAME}`, { method: "PUT", body: form })
-    .catch((e) => die(`Deploy failed: ${e.message}`));
+  // The class has to be declared as a new SQLite class the first time this script carries it. A
+  // script that already has the migration applied is handed the same tag and Cloudflare refuses it,
+  // so the refusal is caught and the deploy goes again without it: the class is already there.
+  const metadata = { main_module: "index.js", compatibility_date: "2026-01-01", bindings,
+    migrations: { new_tag: "do-v1", new_sqlite_classes: ["Portal"] } };
+  const upload = async (meta) => {
+    const form = new FormData();
+    form.set("metadata", new Blob([JSON.stringify(meta)], { type: "application/json" }));
+    form.set("index.js", new Blob([code], { type: "application/javascript+module" }), "index.js");
+    return cf(token, `/accounts/${acc}/workers/scripts/${NAME}`, { method: "PUT", body: form });
+  };
+  await upload(metadata).catch(async (e) => {
+    if (!/migration/i.test(e.message || "")) die(`Deploy failed: ${e.message}`);
+    const { migrations, ...rest } = metadata;
+    await upload(rest).catch((e2) => die(`Deploy failed: ${e2.message}`));
+  });
   say("  Code deployed.");
 
   // 7. The pulse: a cron trigger, every 30 minutes by default.

@@ -3,26 +3,23 @@
 //
 // It is a cache: deleting it loses nothing any portal doesn't hold.
 //
-// It never carries a message between two people (spec §19 row C stands). It caches signed public
-// casts and cards, answers searches over them, keeps the name@mazel directory from signed records
-// portals publish, and tells a subscribed portal that a matching cast exists. Every intro, reply and
-// connect still goes portal to portal on the A2A wire.
+// It never carries a message between two people (spec §7.5, the cache principle). It caches signed public
+// casts and cards, answers searches over them, and keeps the name@mazel directory from signed
+// records portals publish. It never pushes anything to anyone: every intro, reply and connect goes
+// portal to portal on the A2A wire, and a portal finds what is cached by asking.
 //
 // No accounts. A signature is the only auth. TTL on every record.
 //
 // POST /cast            signed public need-cast or card-cast          (7-day TTL)
 // GET  /search?q=&tags= the portal's paraphrase scorer over cached casts
-// POST /subscribe       A2A push config signed by the subscriber; on a matching new cast the relay
-//                       POSTs a signed find.hit to the subscriber's door         (30-day TTL)
 // POST /publish         signed handle record or rotation record -> the directory  (90-day TTL)
 // GET  /.well-known/mazel/<name>.json   the directory record for name@mazel
 // GET  /.well-known/relay.json          this relay's public key
 // GET  /                the sentence above
 
-const RELAY_VERSION = "0.4.0";
+const RELAY_VERSION = "0.5.9";   // stamped by relay/build.mjs from the portal
 const HAAH_URI = "https://mazel.ai/ext/haah/v1";
 const CAST_TTL = 60 * 60 * 24 * 7;
-const SUB_TTL = 60 * 60 * 24 * 30;
 const DIR_TTL = 60 * 60 * 24 * 90;
 const MAX_RESULTS = 10;
 const SENTENCE = "It is a cache: deleting it loses nothing any portal doesn't hold.";
@@ -35,7 +32,7 @@ export default {
     const p = url.pathname;
     try {
       if (p === "/" && request.method === "GET") {
-        return text(`Mazel relay ${RELAY_VERSION}. ${SENTENCE}\nCasts: POST /cast   Search: GET /search?q=   Subscribe: POST /subscribe   Directory: GET /.well-known/mazel/<name>.json\n`);
+        return text(`Mazel relay ${RELAY_VERSION}. ${SENTENCE}\nCasts: POST /cast   Search: GET /search?q=   Directory: GET /.well-known/mazel/<name>.json\n`);
       }
       if (p === "/.well-known/relay.json" && request.method === "GET") {
         const s = await getSigning(env);
@@ -43,11 +40,9 @@ export default {
       }
       const rec = p.match(/^\/\.well-known\/mazel\/([a-z0-9][a-z0-9._-]*)\.json$/);
       if (rec && request.method === "GET") return await directoryGet(env, rec[1].toLowerCase());
-      if (p === "/publish" && request.method === "POST") return await publish(env, await request.json());
-      if (p === "/cast" && request.method === "POST") return await cast(env, origin, await request.json());
+      if (p === "/publish" && request.method === "POST") return await publish(env, await bounded(request));
+      if (p === "/cast" && request.method === "POST") return await cast(env, origin, await bounded(request));
       if (p === "/search" && request.method === "GET") return await search(env, url);
-      if (p === "/subscribe" && request.method === "POST") return await subscribe(env, await request.json());
-      if (p === "/unsubscribe" && request.method === "POST") return await unsubscribe(env, await request.json());
       return json({ error: "not found" }, 404);
     } catch (e) {
       return json({ error: e.message || String(e) }, 400);
@@ -57,14 +52,105 @@ export default {
 
 // ---------------------------------------------------------------------------
 // Storage helpers
-async function kvList(env, prefix) {
-  const list = await env.RELAY.list({ prefix });
+// KV list() returns at most 1000 keys and a cursor. Reading one page and stopping meant that once
+// the cache held more than a thousand casts, search silently only ever saw the first thousand.
+//
+// Listing at all is the expensive part. A free plan allows 1,000 list operations a day, and a cache
+// that scans its own namespace to answer a search spends that budget on being read: the company
+// account hit the ceiling on 2026-10-05. So the keys are kept in one index, written when a cast is
+// written and read when a search is answered. A list happens once in a namespace's life, to build
+// the index for a cache that predates it, and never again.
+const MAX_SCAN = 5000;
+const IDX_CASTS = "idx:casts";
+async function kvList(env, prefix, cap = MAX_SCAN) {
   const out = [];
-  for (const k of list.keys) {
-    const v = await env.RELAY.get(k.name);
-    if (v) out.push({ key: k.name, ...JSON.parse(v) });
+  let cursor;
+  do {
+    const list = await env.RELAY.list(cursor ? { prefix, cursor } : { prefix });
+    for (const k of list.keys) {
+      const v = await env.RELAY.get(k.name);
+      if (v) out.push({ key: k.name, ...JSON.parse(v) });
+      if (out.length >= cap) return out;
+    }
+    cursor = list.list_complete === false ? list.cursor : null;
+  } while (cursor);
+  return out;
+}
+
+// The index: every cast key, with the time it was written, so a search reads one key instead of
+// scanning. Entries past the cast TTL are dropped as it is rewritten, which is also what keeps it
+// from growing without end. It carries no TTL of its own: it is the map, not the territory.
+async function castIndex(env) {
+  const raw = await env.RELAY.get(IDX_CASTS);
+  if (raw) { try { const i = JSON.parse(raw); if (Array.isArray(i.keys)) return i; } catch { /* rebuilt below */ } }
+  // Cold: a cache that was filled before the index existed. Built once, from the only list in here.
+  const keys = [];
+  let cursor;
+  do {
+    const page = await env.RELAY.list(cursor ? { prefix: "cast:", cursor } : { prefix: "cast:" });
+    for (const k of page.keys) keys.push([k.name, Date.now()]);
+    cursor = page.list_complete === false ? page.cursor : null;
+  } while (cursor && keys.length < MAX_SCAN);
+  const idx = { v: 1, keys, updated: new Date().toISOString() };
+  await env.RELAY.put(IDX_CASTS, JSON.stringify(idx));
+  return idx;
+}
+async function indexCast(env, key) {
+  const idx = await castIndex(env);
+  const cut = Date.now() - CAST_TTL * 1000;
+  const keys = idx.keys.filter(([k, at]) => k !== key && at > cut).slice(-MAX_SCAN + 1);
+  keys.push([key, Date.now()]);
+  await env.RELAY.put(IDX_CASTS, JSON.stringify({ v: 1, keys, updated: new Date().toISOString() }));
+}
+
+// Ceilings for anything an anonymous caller can put in the cache. Without them one request stores
+// as much as it likes, and every later search pays to read it.
+const MAX_CAST_BYTES = 16 * 1024;
+// Every body this cache accepts has a ceiling before it is even parsed.
+async function bounded(request) {
+  if (Number(request.headers.get("content-length") || 0) > MAX_CAST_BYTES) throw new Error(`body over ${MAX_CAST_BYTES} bytes`);
+  const raw = await request.text();
+  if (raw.length > MAX_CAST_BYTES) throw new Error(`body over ${MAX_CAST_BYTES} bytes`);
+  return JSON.parse(raw);
+}
+const CAST_FRESH_MS = 1000 * 60 * 60 * 24 * 2;
+const fresh = (at) => {
+  const t = Date.parse(at || "");
+  if (!Number.isFinite(t)) return false;
+  const age = Date.now() - t;
+  return age > -60000 && age < CAST_FRESH_MS;
+};
+const MAX_TAGS_IN = 12;
+const MAX_GLOSSES = 12;
+const MAX_GLOSS_LEN = 200;
+// Per key, per day: nothing bounded how many casts, so one anonymous key could fill the cache all
+// day at the operator's cost.
+const MAX_CASTS_PER_KEY_PER_DAY = 100;
+async function underCap(env, what, cap) {
+  const key = `cap:${what}:${new Date().toISOString().slice(0, 10)}`;
+  const n = Number((await env.RELAY.get(key)) || 0);
+  if (n >= cap) return false;
+  await env.RELAY.put(key, String(n + 1), { expirationTtl: 60 * 60 * 36 });
+  return true;
+}
+const capTags = (v) => (Array.isArray(v) ? v : []).map(normalizeTag).filter(Boolean).slice(0, MAX_TAGS_IN);
+const capGlosses = (g) => {
+  const out = {};
+  if (!g || typeof g !== "object") return out;
+  for (const k of Object.keys(g).slice(0, MAX_GLOSSES)) {
+    const tag = normalizeTag(k);
+    if (tag) out[tag] = String(g[k] == null ? "" : g[k]).slice(0, MAX_GLOSS_LEN);
   }
   return out;
+};
+
+// A name in this directory is ASCII, and the separators people use to make a lookalike are folded
+// away: lea, l.e.a and le-a are one name, and anything outside a-z0-9 is refused outright rather
+// than left to render as a homoglyph in a line of chat.
+function dirName(local) {
+  const folded = String(local || "").toLowerCase().normalize("NFKC").replace(/[._-]/g, "");
+  if (!/^[a-z0-9]{1,32}$/.test(folded)) return null;
+  return folded;
 }
 const put = (env, key, obj, ttl) => env.RELAY.put(key, JSON.stringify(obj), { expirationTtl: ttl });
 
@@ -75,8 +161,7 @@ async function stableId(...parts) {
 }
 
 // ---------------------------------------------------------------------------
-// The relay's own key: signs the find.hit it delivers to subscribers, so a portal can tell a hit
-// really came from the relay it subscribed to.
+// The relay's own key, served at /.well-known/relay.json so a relay can be named by it.
 async function getSigning(env) {
   const raw = await env.RELAY.get("config:signing");
   if (raw) return JSON.parse(raw);
@@ -87,18 +172,10 @@ async function getSigning(env) {
   await env.RELAY.put("config:signing", JSON.stringify(rec));
   return rec;
 }
-async function relaySign(env, payload) {
-  const s = await getSigning(env);
-  const key = await crypto.subtle.importKey("jwk", s.priv, { name: "Ed25519" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign({ name: "Ed25519" }, key, new TextEncoder().encode(canonical(payload)));
-  return { ...payload, sig: b64u(sig), kid: s.kid };
-}
-
-// ---------------------------------------------------------------------------
-// Directory: name@mazel resolves here. A record is accepted when it is signed by the key it names,
-// and, for a name already on file, when a valid rotation chain leads from the stored key to the new one.
 async function directoryGet(env, name) {
-  const raw = await env.RELAY.get(`dir:${name}`);
+  const folded = dirName(name);
+  if (!folded) return json({ error: "no such handle in this directory", name }, 404);
+  const raw = await env.RELAY.get(`dir:${folded}`);
   if (!raw) return json({ error: "no such handle in this directory", name }, 404);
   const { storedAt, ...record } = JSON.parse(raw);
   return json(record);
@@ -119,6 +196,21 @@ async function chainLinks(fromKey, toKey, rotations) {
   return false;
 }
 
+// Ask the portal the record points at whether it agrees. It must serve the same name under the
+// same key: that is what makes squatting cost a portal rather than a single HTTP request.
+async function servesItself(record, name) {
+  const base = String(record.rpc || record.cardUrl || "").replace(/\/(a2a|card|\.well-known\/.*)$/, "");
+  if (!/^https:\/\//.test(base)) return false;
+  try {
+    const res = await fetch(`${base}/.well-known/mazel/${name}.json`, { headers: { accept: "application/json" } });
+    if (!res.ok) return false;
+    const served = await res.json();
+    return served && served.publicKey === record.publicKey && (await verifyPayload(served, served.publicKey));
+  } catch {
+    return false;
+  }
+}
+
 async function publish(env, record) {
   if (!record || typeof record !== "object") throw new Error("body must be a signed handle record");
   const handle = String(record.handle || "").toLowerCase();
@@ -126,7 +218,13 @@ async function publish(env, record) {
   if (!m) throw new Error("this directory holds name@mazel (name@mazel.ai) only");
   if (!record.publicKey || !record.cardUrl || !record.sig) throw new Error("record needs publicKey, cardUrl, sig");
   if (!(await verifyPayload(record, record.publicKey))) throw new Error("record is not signed by the key it names");
-  const name = m[1];
+  const name = dirName(m[1]);
+  if (!name) throw new Error("a name in this directory is 1-32 characters of a-z and 0-9; dots, dashes and underscores fold away and anything else is refused");
+  // The name has to be backed by a portal that serves the same record under the same key. A
+  // directory that takes anyone's word for it hands out names to whoever asks first, for free.
+  if (!(await servesItself(record, name))) {
+    throw new Error(`the portal at ${record.rpc || record.cardUrl} does not serve this same record at /.well-known/mazel/${name}.json, so this name is not yours to publish`);
+  }
   const existingRaw = await env.RELAY.get(`dir:${name}`);
   if (existingRaw) {
     const existing = JSON.parse(existingRaw);
@@ -148,20 +246,44 @@ async function cast(env, origin, body) {
   if (!body || typeof body !== "object") throw new Error("body must be a signed cast");
   if (!body.publicKey || !body.sig) throw new Error("cast needs publicKey and sig");
   if (!(await verifyPayload(body, body.publicKey))) throw new Error("cast is not signed by its publicKey");
+  if (body.kind === "blind") throw new Error("this relay holds no buckets: a held-back need travels only to the cards its owner chose");
   if (body.visibility && body.visibility !== "public") throw new Error("only public casts belong here");
   const kind = body.kind === "card" ? "card" : "need";
   const handle = String(body.handle || "").toLowerCase();
   if (!handle.includes("@")) throw new Error("cast needs a handle");
-  const id = kind === "need" ? await stableId("need", handle, body.needId || body.needText || "") : await stableId("card", handle);
+  // If this directory holds the name, only the key that holds it may cast under it.
+  const local = dirName((handle.match(/^([^@]+)@(mazel|mazel\.ai)$/) || [])[1] || "");
+  if (local) {
+    const heldRaw = await env.RELAY.get(`dir:${local}`);
+    const held = heldRaw ? JSON.parse(heldRaw) : null;
+    if (held && held.publicKey !== body.publicKey) {
+      throw new Error(`${handle} is held in this directory by another key; casts under that name must be signed by it`);
+    }
+    // And a cast's card lives where the record says it does: a copy of a card at some other host,
+    // however right its key, is not the card portals will read for this handle (29e H2).
+    const host = (u) => { try { return new URL(u).host; } catch { return null; } };
+    if (held && body.cardUrl && host(body.cardUrl) !== host(held.rpc || held.cardUrl)) {
+      throw new Error(`${handle}'s record names a card at ${host(held.rpc || held.cardUrl)}; a cast under that name carries that card, not one at ${host(body.cardUrl) || "an unreadable address"}`);
+    }
+  }
+  if (!fresh(body.castAt)) throw new Error("cast is missing a recent castAt; a cast with no time in its signature can be replayed forever");
+  if (!(await underCap(env, `cast:${body.publicKey.slice(0, 16)}`, MAX_CASTS_PER_KEY_PER_DAY))) throw new Error("that key has cast enough for one day here");
+  // Keyed by the signing key, not by the handle. Keying by handle let anyone with a fresh keypair
+  // overwrite the cached card of a handle they do not own, and every portal that searched picked up
+  // their rpc for that person.
+  const id = kind === "card"
+    ? await stableId("card", body.publicKey)
+    : await stableId(kind, body.publicKey, body.needId || body.needText || "");
   const record = {
     id, kind, handle, publicKey: body.publicKey, cardUrl: body.cardUrl || null, rpc: body.rpc || null,
     needId: body.needId || null, needText: String(body.needText || "").slice(0, 300), needTags: (body.needTags || []).map(normalizeTag).filter(Boolean),
-    have: (body.have || []).map(normalizeTag).filter(Boolean), glosses: body.glosses && typeof body.glosses === "object" ? body.glosses : {},
+    have: capTags(body.have), glosses: capGlosses(body.glosses),
     description: String(body.description || "").slice(0, 600), tier: "world", castAt: new Date().toISOString(),
   };
+  record.castAt = body.castAt;   // the signed time, not the time it happened to arrive
   await put(env, `cast:${kind}:${id}`, record, CAST_TTL);
-  const notified = await notifySubscribers(env, origin, record);
-  return json({ ok: true, id, kind, expiresInSeconds: CAST_TTL, notified, sentence: SENTENCE });
+  await indexCast(env, `cast:${kind}:${id}`);
+  return json({ ok: true, id, kind, expiresInSeconds: CAST_TTL, sentence: SENTENCE });
 }
 
 // A cast looks like a known card to the scorer: needs match against haves, and a need-cast is also
@@ -175,7 +297,14 @@ async function search(env, url) {
   const tags = [...new Set(String(url.searchParams.get("tags") || "").split(",").map(normalizeTag).filter(Boolean))];
   if (!q && !tags.length) throw new Error("q or tags required");
   const needWords = needWordsFor(q, tags);
-  const casts = await kvList(env, "cast:");
+  // One read of the index, then one read per cast it names. A key the index still carries but KV
+  // has expired reads back null and is simply skipped; the next cast prunes it.
+  const idx = await castIndex(env);
+  const casts = [];
+  for (const [key] of idx.keys) {
+    const v = await env.RELAY.get(key);
+    if (v) { try { casts.push({ key, ...JSON.parse(v) }); } catch { /* a value we cannot read is not a result */ } }
+  }
   const scored = [];
   for (const c of casts) {
     const card = castAsCard(c);
@@ -201,58 +330,6 @@ function scoreNeedCast(c, tags, needWords) {
   for (const w of needWords) if (theirs.has(w)) overlap++;
   if (overlap >= 2) { score += overlap; if (!matched.length) matched.push(c.needTags[0] || "need"); }
   return { score, matched, descHits: 0 };
-}
-
-// ---------------------------------------------------------------------------
-// Subscriptions: an A2A push-notification config signed by the subscribing portal. When a new cast
-// matches the subscriber's haves, the relay POSTs a signed find.hit to the subscriber's door.
-async function subscribe(env, body) {
-  if (!body || !body.publicKey || !body.sig) throw new Error("subscription needs publicKey and sig");
-  if (!(await verifyPayload(body, body.publicKey))) throw new Error("subscription is not signed by its publicKey");
-  const cfg = body.config || {};
-  if (!/^https:\/\//.test(String(cfg.url || ""))) throw new Error("config.url must be https");
-  const handle = String(body.handle || "").toLowerCase();
-  const id = await stableId("sub", handle, cfg.url);
-  const record = { id, handle, publicKey: body.publicKey, url: cfg.url, token: String(cfg.token || ""), taskId: String(cfg.taskId || "*"), have: (body.have || []).map(normalizeTag).filter(Boolean), glosses: body.glosses || {}, description: String(body.description || "").slice(0, 600), createdAt: new Date().toISOString() };
-  await put(env, `sub:${id}`, record, SUB_TTL);
-  return json({ ok: true, id, expiresInSeconds: SUB_TTL, sentence: SENTENCE });
-}
-
-async function unsubscribe(env, body) {
-  if (!body || !body.publicKey || !body.sig) throw new Error("needs publicKey and sig");
-  if (!(await verifyPayload(body, body.publicKey))) throw new Error("not signed by its publicKey");
-  const id = await stableId("sub", String(body.handle || "").toLowerCase(), String((body.config || {}).url || ""));
-  await env.RELAY.delete(`sub:${id}`);
-  return json({ ok: true, id });
-}
-
-// For a new need-cast, find subscribers whose haves fit it and deliver a find.hit to each.
-async function notifySubscribers(env, origin, castRecord) {
-  if (castRecord.kind !== "need") return 0;
-  const subs = await kvList(env, "sub:");
-  const needWords = needWordsFor(castRecord.needText, castRecord.needTags);
-  let delivered = 0;
-  for (const s of subs) {
-    if (s.handle === castRecord.handle) continue;
-    const asCard = { url: s.url, handle: s.handle, rpc: s.url, description: s.description, have: s.have, glosses: s.glosses, tier: "world" };
-    const m = scoreCard(asCard, castRecord.needTags, needWords);
-    if (m.score < 2 || !m.matched.length) continue;
-    const hit = await relaySign(env, {
-      v: 1, type: "find.hit", via: "relay", relay: origin, needId: castRecord.needId, needText: castRecord.needText, needTags: castRecord.needTags,
-      from: { handle: castRecord.handle, cardUrl: castRecord.cardUrl, rpc: castRecord.rpc, publicKey: castRecord.publicKey },
-      matchedTags: m.matched, why: `${castRecord.handle} is looking for ${castRecord.needText}; you have ${m.matched.join(", ")}.`, at: new Date().toISOString(),
-    });
-    try {
-      const res = await fetch(s.url, {
-        method: "POST", headers: { "content-type": "application/json", "A2A-Version": "1.0", ...(s.token ? { authorization: `Bearer ${s.token}` } : {}) },
-        body: JSON.stringify({ jsonrpc: "2.0", id: hit.needId || crypto.randomUUID(), method: "SendMessage", params: { message: {
-          messageId: await stableId("hit", s.id, castRecord.id), contextId: "", taskId: s.taskId, role: "ROLE_AGENT", parts: [{ text: hit.why }],
-          metadata: { handle: `relay@${new URL(origin).host}`, cardUrl: `${origin}/.well-known/relay.json`, action: hit }, extensions: [HAAH_URI], referenceTaskIds: [] } } }),
-      });
-      if (res.ok) delivered++;
-    } catch {}
-  }
-  return delivered;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +407,7 @@ function whyLine(card, m, needText) {
 function candidateFor(card, needTags, needWords, needText) {
   const m = scoreCard(card, needTags, needWords);
   if (m.score < 2 || !m.matched.length) return null;
-  return { cardUrl: card.url, handle: card.handle, rpc: card.rpc, tier: card.tier, score: m.score, matchedTags: m.matched, why: whyLine(card, m, needText), addedAt: new Date().toISOString() };
+  return { cardUrl: card.url, handle: card.handle, tier: card.tier, score: m.score, matchedTags: m.matched, why: whyLine(card, m, needText), addedAt: new Date().toISOString() };
 }
 
 function needWordsFor(needText, needTags) {

@@ -5,11 +5,18 @@
 
   "//": "One Worker per person, on their own Cloudflare account. Deploy to Cloudflare provisions the mailbox and sets the pulse from this file; nothing here needs editing, and nothing personal lives in it. Your handle and your card are written in your first conversation with your own AI, not here.",
 
+  "//guard": "bin/deploy-guard.mjs stops a wrangler deploy run from a clone: this file has no KV id, so a deploy from here would bind a new empty mailbox and strand the old one. Deploy to Cloudflare runs in CI, where the guard passes. Updates go through create-mazel.",
+  "build": { "command": "node bin/deploy-guard.mjs" },
+
   "kv_namespaces": [{ "binding": "MAILBOX" }],
+
+  "//store": "The portal's state lives in a Durable Object on the SQLite backend, which runs on the free plan. KV stays bound: the published public card lives there, and a portal that predates the object still reads and writes KV until it is migrated.",
+  "durable_objects": { "bindings": [{ "name": "PORTAL", "class_name": "Portal" }] },
+  "migrations": [{ "tag": "do-v1", "new_sqlite_classes": ["Portal"] }],
 
   "triggers": { "crons": ["*/30 * * * *"] },
 
-  "vars": { "RELAY_URL": "https://relay.mazel-peer.workers.dev" },
+  "vars": { "RELAY_URL": "https://relay.mazel-peer.workers.dev", "STORE": "do" },
 
   "observability": { "enabled": true }
 }

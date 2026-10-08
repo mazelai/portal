@@ -14,6 +14,8 @@ const json = (res, obj, status=200) => { res.writeHead(status, {'content-type':'
 // A fake Cloudflare: the OAuth token endpoint and the bits of the API the installer touches.
 const seen = { deploy: null, kv: null, crons: null, verifier: null, grant: null };
 let challenge = null, scripts = [];
+// What an already-installed portal is carrying when an update runs over it.
+let existingBindings = [];
 const resetChallenge = () => { challenge = null; };
 const fake = createServer(async (req, res) => {
   const u = new URL(req.url, 'http://127.0.0.1');
@@ -30,12 +32,17 @@ const fake = createServer(async (req, res) => {
   if (u.pathname === '/accounts') return json(res, { success:true, result:[{ id:'acc1', name:"Someone's Account" }] });
   if (u.pathname.endsWith('/workers/subdomain')) return json(res, { success:true, result:{ subdomain:'mazel-abcd' } });
   if (u.pathname.endsWith('/workers/scripts')) return json(res, { success:true, result: scripts });
+  if (/\/workers\/scripts\/mazel\/settings$/.test(u.pathname)) return json(res, { success:true, result: { bindings: existingBindings } });
   if (u.pathname.endsWith('/storage/kv/namespaces') && req.method === 'GET') return json(res, { success:true, result: [] });
   if (u.pathname.endsWith('/storage/kv/namespaces')) { seen.kv = JSON.parse(body).title; return json(res, { success:true, result:{ id:'ns1', title: seen.kv } }); }
   if (u.pathname.endsWith('/schedules')) { seen.crons = JSON.parse(body); return json(res, { success:true, result:{} }); }
   if (/\/workers\/scripts\/mazel\/subdomain$/.test(u.pathname)) return json(res, { success:true, result:{} });
   if (/\/workers\/scripts\/mazel$/.test(u.pathname) && req.method === 'PUT') {
-    const m = body.match(/\{"main_module".*?\}\]\}/s); seen.deploy = m ? JSON.parse(m[0]) : { raw: body.slice(0,200) };
+    // The metadata is one JSON form part. Read from its opening brace and let the parser find the
+    // end, so adding a field after bindings does not quietly stop this capture working.
+    const at = body.indexOf('{"main_module"');
+    seen.deploy = { raw: body.slice(0, 200) };
+    if (at >= 0) for (let end = body.length; end > at; end--) { try { seen.deploy = JSON.parse(body.slice(at, end)); break; } catch { /* keep shrinking */ } }
     scripts = [{ id:'mazel' }];
     return json(res, { success:true, result:{ id:'mazel' } });
   }
@@ -48,10 +55,10 @@ const base = `http://127.0.0.1:${fake.address().port}`;
 const freePort = async () => { const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r)); const p = s.address().port; await new Promise(r => s.close(r)); return p; };
 let PORT = 0;
 
-const run = (mode = 'good') => new Promise((resolve) => {
+const run = (mode = 'good', extra = []) => new Promise((resolve) => {
   resetChallenge();
   let played = false;
-  const p = spawn(process.execPath, [CLI], { env: { ...process.env,
+  const p = spawn(process.execPath, [CLI, ...extra], { env: { ...process.env,
     MAZEL_API_BASE: base, MAZEL_OAUTH_AUTH: base + '/oauth2/auth', MAZEL_OAUTH_TOKEN: base + '/oauth2/token',
     MAZEL_OAUTH_PORT: String(PORT), MAZEL_NO_BROWSER: '1', MAZEL_PORTAL_BASE: base + '/portal',
     CLOUDFLARE_API_TOKEN: '' } });
@@ -89,6 +96,14 @@ ok('it sets the pulse to every 30 minutes', JSON.stringify(seen.crons) === '[{"c
 const names = Object.fromEntries((seen.deploy?.bindings || []).map(b => [b.name, b.type]));
 ok('a new portal deploys with a mailbox, a key, and no card at all', names.MAILBOX === 'kv_namespace' && names.INBOX_TOKEN === 'secret_text' && !('HANDLE' in names) && !('PERSONA' in names), JSON.stringify(names));
 ok('it knows its own address, so the scheduled pulse can run', names.PORTAL_ORIGIN === 'plain_text' && names.RELAY_URL === 'plain_text');
+// The storage object: bound on every portal, declared as a SQLite class the first time, and
+// switched on for a new portal, which has nothing to migrate.
+ok('a new portal is bound to the storage object', names.PORTAL === 'durable_object_namespace', JSON.stringify(names));
+ok('and the class is declared on the SQLite backend, which the free plan allows',
+   JSON.stringify(seen.deploy?.migrations) === '{"new_tag":"do-v1","new_sqlite_classes":["Portal"]}', JSON.stringify(seen.deploy?.migrations));
+ok('and a new portal keeps its state in the object from the start', names.STORE === 'plain_text' &&
+   (seen.deploy?.bindings || []).find(b => b.name === 'STORE')?.text === 'do', JSON.stringify((seen.deploy?.bindings || []).find(b => b.name === 'STORE')));
+ok('the mailbox namespace is still bound, because the published card lives there', names.MAILBOX === 'kv_namespace');
 ok('it prints one connector line to paste into an AI', /\/mcp\?token=[a-f0-9]{64}/.test(first.out) && /Paste this into your AI/.test(first.out));
 ok('it says what to say next', /say "mazel"/.test(first.out));
 ok('it ends clean', first.code === 0, 'exit ' + first.code);
@@ -97,8 +112,47 @@ ok('nothing was written to this machine', !/\.wrangler|config\.toml|saved|stored
 // A sign-in that comes back with the wrong state is an attempt, not a mistake: it stops there.
 scripts = [];
 PORT = await freePort();
+// An update over a portal that is still on KV must not move its storage: the object is bound and
+// the class is there, but STORE is left alone, because migration is its own step with an export
+// and a verify in front of it.
+{
+  scripts = [{ id: 'mazel' }];                     // the portal is already there, so this is an update
+  existingBindings = [{ type: 'secret_text', name: 'INBOX_TOKEN' }];
+  const upd = await run();
+  const u = Object.fromEntries((seen.deploy?.bindings || []).map(b => [b.name, b]));
+  ok('an update binds the object to a portal that predates it', u.PORTAL && u.PORTAL.type === 'durable_object_namespace', JSON.stringify(Object.keys(u)));
+  ok('but does not move its storage: STORE is not set by an update', !u.STORE, JSON.stringify(u.STORE || null));
+  ok('and it keeps the key it already had', u.INBOX_TOKEN && u.INBOX_TOKEN.type === 'inherit', JSON.stringify(u.INBOX_TOKEN));
+  ok('an update ends clean', upd.code === 0, 'exit ' + upd.code);
+  // A portal already migrated keeps STORE=do, because the update inherits whatever it carries.
+  existingBindings = [{ type: 'secret_text', name: 'INBOX_TOKEN' }, { type: 'plain_text', name: 'STORE' }];
+  await run();
+  const m = Object.fromEntries((seen.deploy?.bindings || []).map(b => [b.name, b]));
+  ok('a portal already in the object stays in it across an update', m.STORE && m.STORE.type === 'inherit', JSON.stringify(m.STORE));
+  // --store is the one thing that moves a portal, and it is a separate run from an ordinary update.
+  existingBindings = [{ type: 'secret_text', name: 'INBOX_TOKEN' }];
+  const moved = await run(undefined, ['--store', 'do']);
+  const mv = Object.fromEntries((seen.deploy?.bindings || []).map(b => [b.name, b]));
+  ok('--store do moves a portal on KV into the object, and says so', mv.STORE?.text === 'do' && /read and write its storage object/.test(moved.out), JSON.stringify(mv.STORE));
+  ok('and it says the KV copy is left alone, because that is the rollback', /KV copy is left exactly as it is/.test(moved.out));
+  const backRun = await run(undefined, ['--store', 'kv']);
+  ok('--store kv brings it back and names what to copy first', !Object.fromEntries((seen.deploy?.bindings || []).map(b => [b.name, b])).STORE && /copy it back first with migrate_store/.test(backRun.out), backRun.out.split('\n').find(l => /Storage:/.test(l))?.slice(0, 80));
+  existingBindings = [];
+  scripts = [];                                    // back to a clean account for the run below
+}
+
 const tampered = await run('badstate');
 ok('a callback with the wrong state stops the install', tampered.code === 1 && /wrong state; nothing was done/.test(tampered.out), tampered.out.trim().split('\n').pop());
+
+// A live Cloudflare token rides on every API call, so the endpoint overrides only point at this
+// machine. Anything that can set one environment variable must not be able to redirect it.
+const away = await new Promise((resolve) => {
+  const p2 = spawn(process.execPath, [CLI, '--yes', '--dry-run'], { env: { ...process.env, MAZEL_API_BASE: 'https://exfiltration.example', CLOUDFLARE_API_TOKEN: 'live-token' } });
+  let out = ''; p2.stdout.on('data', c => out += c); p2.stderr.on('data', c => out += c);
+  p2.on('close', () => resolve(out));
+});
+ok('an api base pointing off this machine is ignored', /Ignoring https:\/\/exfiltration.example/.test(away), away.split('\n').find(l => /Ignoring/.test(l)) || away.slice(0,80));
+ok('and nothing was sent there', !/exfiltration\.example\/accounts/.test(away));
 
 fake.close();
 console.log(`\ncli: ${pass} passed, ${fail} failed`);

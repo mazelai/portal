@@ -1,6 +1,6 @@
 {
-  "name": "ariel@mazel",
-  "description": "Ariel runs Paragon.",
+  "name": "avery@mazel",
+  "description": "Avery runs Halcyon.",
   "supportedInterfaces": [
     {
       "url": "https://mazel.fixture.workers.dev/a2a",
@@ -13,7 +13,7 @@
     "organization": "Mazel",
     "url": "https://mazel.ai"
   },
-  "version": "0.4.1",
+  "version": "0.5.9",
   "documentationUrl": "https://mazel.ai",
   "capabilities": {
     "streaming": false,
@@ -24,7 +24,7 @@
         "description": "Mazel HAAH: a handle, Need and Have tags with one-line glosses, and the find / intro actions carried in message metadata. See https://mazel.ai",
         "required": false,
         "params": {
-          "handle": "ariel@mazel",
+          "handle": "avery@mazel",
           "cardUrl": "https://mazel.fixture.workers.dev/card",
           "need": [
             "tech-advisor-partners"
@@ -35,8 +35,8 @@
           "glosses": {
             "managed-ai-delivery": "A team that builds and runs AI in your cloud"
           },
-          "publicKey": "KJeTGqFdebsOqGYqSfEQoMxuCFwOxH0XtsFn3qHXbQ8",
-          "keyId": "d3VsRIbbYAyZCZxK"
+          "publicKey": "wYcor4fe1YNBl2OL_fvWHIM4I0Fv5ip7zWqAewmaTiM",
+          "keyId": "3GhXQcarb0GQGTnA"
         }
       }
     ],

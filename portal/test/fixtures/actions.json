@@ -4,9 +4,14 @@
     "v": 1
   },
   {
-    "type": "intro.propose",
     "v": 1,
-    "introId": "648448b6dff07d08958b1fdee7223c45",
+    "handle": "avery@mazel",
+    "publicKey": "wYcor4fe1YNBl2OL_fvWHIM4I0Fv5ip7zWqAewmaTiM",
+    "cardUrl": "https://mazel.fixture.workers.dev/.well-known/agent-card.json",
+    "rpc": "https://mazel.fixture.workers.dev/a2a",
+    "castAt": "2026-10-08T06:53:06.408Z",
+    "type": "intro.propose",
+    "introId": "7b811cc11fd68bd23053ded8d0183c6b",
     "why": "You need someone who has crossed the Atlantic by sailboat; peer@mazel has sailing-atlantic.",
     "needText": "someone who has crossed the Atlantic by sailboat",
     "needTags": [
@@ -16,36 +21,31 @@
     "matchedTags": [
       "sailing-atlantic"
     ],
+    "ask": {
+      "kind": "other",
+      "size": ""
+    },
     "path": [
-      "ariel@mazel"
+      "avery@mazel"
     ],
     "proposer": {
-      "handle": "ariel@mazel",
+      "handle": "avery@mazel",
       "cardUrl": "https://mazel.fixture.workers.dev/card",
       "rpc": "https://mazel.fixture.workers.dev/a2a"
-    }
+    },
+    "contextId": "54a847d5fd5f3de22992e5913d9edc6e",
+    "sig": "Oev_c7ZYYr8pHh1G5Og80R4twQP3P39bycIChUzgHp8BnvGov7F7NJJ8_38lYHuqvbO2esEYY5oFcLveWIZfBQ",
+    "kid": "3GhXQcarb0GQGTnA"
   },
   {
     "type": "intro.respond",
     "v": 1,
-    "introId": "648448b6dff07d08958b1fdee7223c45",
+    "introId": "7b811cc11fd68bd23053ded8d0183c6b",
     "decision": "accepted",
     "note": "Yes.",
     "path": [
-      "ariel@mazel",
+      "avery@mazel",
       "peer@mazel"
-    ]
-  },
-  {
-    "type": "find.request",
-    "v": 1,
-    "needText": "a hockey player in Tokyo",
-    "needTags": [
-      "hockey",
-      "tokyo"
-    ],
-    "path": [
-      "ariel@mazel"
     ]
   }
 ]
