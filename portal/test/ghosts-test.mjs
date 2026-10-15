@@ -556,6 +556,198 @@ ok('nor in what the relay holds', !JSON.stringify([...renv.RELAY.m.values()]).ma
   ok('REV L5: and a repeat save of one of them finds that one, by the witness they share', sams2.length === 2 && sams2.some((x) => (x.have || []).includes('estate-planning')), `${sams2.length} records`);
 }
 
+// ---- an open door: anyone may write about a need the owner opened ----------------------------
+{
+  const OW = 'https://mazel.owner.gh', SE = 'https://mazel.sender.gh', TH = 'https://mazel.third.gh';
+  portals[OW] = { HANDLE:'ola@mazel', PERSONA:'Ola builds things.', NEED:'', HAVE:'tooling', INBOX_TOKEN:'to', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: OW, OWNER_EMAIL:'ola@x.example', FEEDBACK_HANDLE:'ola@mazel' };
+  portals[SE] = { HANDLE:'sid@mazel', PERSONA:'Sid tries things.', NEED:'', HAVE:'testing', INBOX_TOKEN:'ts', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: SE, OWNER_EMAIL:'sid@x.example', FEEDBACK_HANDLE:'ola@mazel' };
+  portals[TH] = { HANDLE:'tam@mazel', PERSONA:'Tam watches.', NEED:'', HAVE:'watching', INBOX_TOKEN:'tt', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: TH, OWNER_EMAIL:'tam@x.example', FEEDBACK_HANDLE:'ola@mazel' };
+  // Everyone publishes their record first, the way a portal does on install: the gate resolves a
+  // sender through the directory, so a portal that has never pulsed cannot be verified by anyone.
+  for (const o of [OW, SE, TH]) await call(o, 'pulse');
+  await call(SE, 'add_known_card', { url: OW + '/card' });
+
+  // A closed need refuses a direct message, and says so rather than swallowing it.
+  await call(OW, 'update_card', { add_need: 'closed-thing', confirmed: true });
+  const WORDS = "the find tool said 'nothing fits' but I'm sure Dana does -- also pls don't reword this: 2 > 1 & \"quotes\"";
+  const closed = await call(SE, 'tell', { to: 'ola@mazel', need: 'closed-thing', words: WORDS, confirmed: true });
+  ok('DOOR: a closed need refuses a message written to it', /no open door for closed-thing/.test(closed), closed.slice(0, 110));
+  ok('DOOR: and the words come back to the sender to keep', /Not delivered/.test(closed) ? /still yours to keep/.test(closed) : true);
+  const boxAfterClosed = await call(OW, 'check_mailbox');
+  ok('DOOR: nothing landed in the owner\'s box', !boxAfterClosed.includes('closed-thing'));
+
+  // The owner opens one, which only makes sense on a need strangers can see.
+  let refusedHeld = '';
+  try { refusedHeld = await call(OW, 'update_card', { add_need: 'quiet-thing', need_visibility: 'matched-only', open_door: true, confirmed: true }); } catch (e) { refusedHeld = e.message; }
+  ok('DOOR: a need nobody can see cannot be opened to anyone', /only makes sense on a public need/.test(refusedHeld), refusedHeld.slice(0, 80));
+  const opened = await call(OW, 'update_card', { add_need: 'tool-feedback', open_door: true, confirmed: true });
+  ok('DOOR: the owner opens a public need, and is told what that means', /open door: anyone may write to you about this one/.test(opened), opened.split('\n')[0].slice(0, 120));
+  ok('DOOR: the card says so where the owner reads it', /\(open door\)/.test(portals[OW].MAILBOX.m.get('memory:card.md')));
+
+  // Nothing sends without the person's yes, and the draft quotes exactly what would go.
+  const draft = await call(SE, 'tell', { to: 'ola@mazel', need: 'tool-feedback', words: WORDS, agent_note: 'called find with tags [revenue-cycle]; got "nothing fits"' });
+  ok('DOOR: unconfirmed sends nothing and shows the exact words', /Not sent/.test(draft) && draft.includes(WORDS), draft.slice(0, 70));
+  ok('DOOR: and keeps the agent\'s note visibly separate from theirs', /labelled as yours and not theirs/.test(draft), 'draft labels the note');
+  const boxAfterDraft = await call(OW, 'check_mailbox');
+  ok('DOOR: nothing arrived from the draft', !boxAfterDraft.includes('tool-feedback'));
+
+  // The real thing.
+  const sent = await call(SE, 'tell', { to: 'ola@mazel', need: 'tool-feedback', words: WORDS, agent_note: 'called find with tags [revenue-cycle]; got "nothing fits"', confirmed: true });
+  ok('DOOR: a confirmed message is delivered', /Sent to ola@mazel about tool-feedback/.test(sent), sent.slice(0, 80));
+  const box = JSON.parse(await call(OW, 'check_mailbox'));
+  const item = (box.messages || []).find((m) => (m.text || '').includes('tool-feedback'));
+  ok('DOOR: it lands in the owner\'s box as an ordinary message', !!item && /wrote to you about tool-feedback/.test(item.text), item ? item.text.slice(0, 80) : 'nothing');
+  ok('DOOR: the words arrive byte for byte', !!item && item.text.includes(WORDS), 'exact');
+  ok('DOOR: and fenced, like anything another portal wrote', !!item && /<<peer>>/.test(item.text));
+  ok('DOOR: the agent note is there and labelled as the agent\'s', !!item && /Their agent adds, as the agent/.test(item.text) && item.text.includes('nothing fits'), 'labelled');
+  const conv = [...portals[OW].MAILBOX.m.entries()].filter(([k]) => k.startsWith('conv:')).map(([, v]) => JSON.parse(v)).find((c) => (c.origin || {}).kind === 'door');
+  ok('DOOR: one conversation, named after the need', !!conv && conv.origin.needTag === 'tool-feedback' && conv.humans === true, conv ? conv.title : 'none');
+  const stored = [...portals[OW].MAILBOX.m.entries()].filter(([k]) => k.startsWith('convm:')).map(([, v]) => JSON.parse(v)).filter((x) => x.message && x.message.contextId === conv.contextId);
+  ok('DOOR: the person\'s words are stored as the person\'s', stored.some((x) => x.author === 'human' && x.message.parts[0].text === WORDS), `${stored.length} entries`);
+  ok('DOOR: and the agent\'s note as the agent\'s, never merged into theirs',
+     stored.some((x) => x.author === 'agent' && /called find/.test(x.message.parts[0].text)) && !stored.some((x) => x.author === 'human' && /called find/.test(x.message.parts[0].text)), 'separate');
+
+  // A second message continues the same conversation rather than starting a pile.
+  await call(SE, 'tell', { to: 'ola@mazel', need: 'tool-feedback', words: 'one more thing', confirmed: true });
+  const convs = [...portals[OW].MAILBOX.m.entries()].filter(([k]) => k.startsWith('conv:')).map(([, v]) => JSON.parse(v)).filter((c) => (c.origin || {}).kind === 'door');
+  ok('DOOR: a second message continues the one conversation', convs.length === 1, `${convs.length} conversations`);
+
+  // Five a day per sender per door; the sixth is refused in words the sender can act on.
+  let last = '';
+  for (let i = 0; i < 5; i++) last = await call(SE, 'tell', { to: 'ola@mazel', need: 'tool-feedback', words: `another ${i}`, confirmed: true });
+  ok('DOOR: over the day\'s five, the sender is told and keeps the words', /Not delivered/.test(last) && /limit/.test(last) && /still yours to keep/.test(last), last.slice(0, 110));
+  // A different sender has their own allowance.
+  await call(TH, 'add_known_card', { url: OW + '/card' });
+  const other = await call(TH, 'tell', { to: 'ola@mazel', need: 'tool-feedback', words: 'from somebody else entirely', confirmed: true });
+  ok('DOOR: and the limit is per sender, not per door', /Sent to ola@mazel/.test(other), other.slice(0, 60));
+
+  // The length cap.
+  const long = await call(TH, 'tell', { to: 'ola@mazel', need: 'tool-feedback', words: 'x'.repeat(2100), confirmed: true });
+  ok('DOOR: a message past the length cap is refused before it is sent', /2100 characters and an open door takes 2000/.test(long), long.slice(0, 80));
+
+  // Feedback with no `to` goes to the handle the setting names.
+  const fb = await call(SE, 'tell', { words: 'the box is confusing' });
+  ok('DOOR: feedback with no handle goes to the one FEEDBACK_HANDLE names', /would go to ola@mazel about mazel-product-feedback/.test(fb), fb.split('\n')[0].slice(0, 90));
+  // Mazel's own door, which is what FEEDBACK_HANDLE points at.
+  await call(OW, 'update_card', { add_need: 'mazel-product-feedback', open_door: true, confirmed: true });
+  // And a portal that holds nobody's card can still send it: feedback has to work on day one.
+  const FR = 'https://mazel.firstday.gh';
+  portals[FR] = { HANDLE:'fia@mazel', PERSONA:'Fia just installed.', NEED:'', HAVE:'', INBOX_TOKEN:'tf', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: FR, FEEDBACK_HANDLE:'ola@mazel' };
+  await call(FR, 'pulse');
+  const held = await call(FR, 'cards', { action: 'list' });
+  ok('DOOR: precondition - the new portal holds nobody', /No known cards/.test(held) || JSON.parse(held).length === 0, held.slice(0, 40));
+  const day1 = await call(FR, 'tell', { words: 'I cannot tell what this did', confirmed: true });
+  ok('DOOR: a portal holding no cards can still send feedback on its first day', /Sent to ola@mazel about mazel-product-feedback/.test(day1), day1.slice(0, 90));
+  // The project handle, answered for by whichever portal the directory's owner points it at. The
+  // portal serves and signs the record under the alias, the directory checks that it does, and a
+  // message addressed to the alias is taken by that portal as its own.
+  portals[OW].ALIAS_HANDLES = 'feedback@mazel';
+  await call(OW, 'pulse');
+  const served = await (await worker.fetch(new Request(OW + '/.well-known/mazel/feedback.json'), portals[OW])).json();
+  ok('ALIAS: the portal serves the record for the name it answers for', served.handle === 'feedback@mazel' && served.publicKey === JSON.parse(portals[OW].MAILBOX.m.get('config:signing')).pub, JSON.stringify({ h: served.handle, k: String(served.publicKey).slice(0, 10) }));
+  const inDir = renv.RELAY.m.get('dir:feedback');
+  ok('ALIAS: and the directory holds it, pointing at that portal', !!inDir && JSON.parse(inDir).handle === 'feedback@mazel' && JSON.parse(inDir).rpc === OW + '/a2a', inDir ? JSON.parse(inDir).rpc : 'not in the directory');
+  ok('ALIAS: the portal\'s own name still resolves to itself', JSON.parse(renv.RELAY.m.get('dir:ola')).handle === 'ola@mazel');
+  // A fresh portal, told nothing but the project handle, reaches it.
+  const AL = 'https://mazel.alias-sender.gh';
+  portals[AL] = { HANDLE:'ali@mazel', PERSONA:'Ali just installed.', NEED:'', HAVE:'', INBOX_TOKEN:'tal', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: AL };
+  await call(AL, 'pulse');
+  const viaAlias = await call(AL, 'tell', { words: 'the open door worked but I could not tell where it went', confirmed: true });
+  ok('ALIAS: a portal with the default reaches the project handle', /Sent to feedback@mazel about mazel-product-feedback/.test(viaAlias), viaAlias.slice(0, 95));
+  const aliasBox = JSON.parse(await call(OW, 'check_mailbox'));
+  const landed = (aliasBox.messages || []).find((m) => /could not tell where it went/.test(m.text || ''));
+  ok('ALIAS: and it lands in the box of the portal the alias points at', !!landed, landed ? landed.text.slice(0, 80) : 'nothing');
+  // An alias is not a way to read somebody else's mail: a portal that does not answer for a name
+  // drops a message addressed to it.
+  portals[TH].ALIAS_HANDLES = '';
+  const wrong = await call(AL, 'tell', { to: 'feedback@mazel', need: 'mazel-product-feedback', words: 'second try', confirmed: true });
+  ok('ALIAS: a message to the alias reaches only the portal that answers for it', /Sent to feedback@mazel/.test(wrong) && !(await call(TH, 'check_mailbox')).includes('second try'), 'tam was not sent it');
+
+  // No feedback door set: the portal says so and the words stay with the person. The handle is a
+  // deploy variable, so a portal nobody configured has nowhere to send and must not invent one.
+  const NF = 'https://mazel.nodoor.gh';
+  portals[NF] = { HANDLE:'nod@mazel', PERSONA:'Nod installed from somewhere else.', NEED:'', HAVE:'', INBOX_TOKEN:'tnd', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: NF, FEEDBACK_HANDLE: 'none' };
+  let nowhere = '';
+  try { nowhere = await call(NF, 'tell', { words: 'who do I even tell', confirmed: true }); } catch (e) { nowhere = e.message; }
+  ok('DOOR: a portal with no feedback door set says so and sends nothing', /no feedback door set/.test(nowhere) && /keep them/.test(nowhere), nowhere.slice(0, 95));
+}
+
+// ---- what a person can say, and the reinstall warning -----------------------------------------
+{
+  const NW = 'https://mazel.newbie.gh';
+  portals[NW] = { HANDLE:'nan@mazel', PERSONA:'', NEED:'', HAVE:'', INBOX_TOKEN:'tn', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: NW };
+  const setup = await call(NW, 'update_card', { persona: 'Nan runs a bakery.', add_have: ['sourdough'], witnesses: ['typed'], confirmed: true });
+  const said = JSON.parse(setup.slice(setup.lastIndexOf('{\n  "you_can_say"')));
+  ok('SAY: the card being written tells the agent what the person can say', !!said && Array.isArray(said.you_can_say.lines) && said.you_can_say.lines.length === 5, JSON.stringify(said && said.you_can_say.lines));
+  ok('SAY: and the list is the five', !!said && said.you_can_say.lines.join(' ').includes('mazel, I need') && said.you_can_say.lines.join(' ').includes('send feedback to Mazel'), JSON.stringify(said && said.you_can_say.lines));
+  ok('SAY: said once and not explained', !!said && /Then stop/.test(said.you_can_say.then));
+  const card = JSON.parse(await call(NW, 'my_card'));
+  ok('SAY: and my_card answers "mazel" or "mazel help" with the same list', (card.you_can_say || {}).lines.join('|') === said.you_can_say.lines.join('|'));
+
+  // One ask after the first find, and never again.
+  const f1 = JSON.parse(await call(NW, 'find', { need_text: 'a miller who stone-grinds rye', tags: ['stone-ground-rye'] }));
+  ok('ASK: the first find suggests one question, once', !!f1.ask_once && /Anything confusing so far/.test(f1.ask_once.ask), f1.ask_once && f1.ask_once.ask);
+  ok('ASK: and says to drop it if they skip it', !!f1.ask_once && /never comes back/.test(f1.ask_once.how));
+  const f2 = JSON.parse(await call(NW, 'find', { need_text: 'a cooper for oak barrels', tags: ['coopering'] }));
+  ok('ASK: the second find does not ask again', !f2.ask_once, JSON.stringify(f2.ask_once || null));
+  const nbox = await call(NW, 'check_mailbox');
+  ok('ASK: and it never becomes a thing in their box', !nbox.includes('confusing'));
+}
+
+// ---- the reinstall warning: this portal's own record names somebody else's key ----------------
+// Exactly what a reinstall leaves behind: the first portal published its key, the second portal has
+// a different one under the same handle, and the directory will not replace a key without a signed
+// chain from it. Every peer that looks the owner up gets the old key and refuses their card.
+{
+  const OLD = 'https://mazel.rio-first.gh', NEW = 'https://mazel.rio-again.gh';
+  portals[OLD] = { HANDLE:'rio@mazel', PERSONA:'Rio, first time.', NEED:'', HAVE:'pottery', INBOX_TOKEN:'t1', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: OLD };
+  await call(OLD, 'pulse');
+  const quiet = await call(OLD, 'pulse');
+  ok('REINSTALL: the portal whose key the directory names is told nothing', !/directory still holds a different key/.test(quiet), quiet.slice(0, 55));
+
+  portals[NEW] = { HANDLE:'rio@mazel', PERSONA:'', NEED:'', HAVE:'', INBOX_TOKEN:'t2', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: NEW };
+  const warnedAtSetup = await call(NEW, 'update_card', { persona: 'Rio, starting over.', add_have: ['pottery'], witnesses: ['typed'], confirmed: true });
+  const told = JSON.parse(warnedAtSetup.slice(warnedAtSetup.lastIndexOf('{\n  "you_can_say"')));
+  ok('REINSTALL: setup tells the person, before anything else', /^TELL THEM THIS FIRST: The Mazel directory still holds a different key for rio@mazel/.test(warnedAtSetup), warnedAtSetup.slice(0, 95));
+  ok('REINSTALL: and names both ways out', !!told && /handle nobody has used/.test(told.tell_them_first) && /clear the old record/.test(told.tell_them_first));
+  ok('REINSTALL: and says nothing is lost', !!told && /nothing you have said to anyone is lost/.test(told.tell_them_first));
+  ok('REINSTALL: and the what-you-can-say list comes with it', !!told && (told.you_can_say || {}).lines.length === 5);
+
+  const warnedOnPulse = await call(NEW, 'pulse');
+  ok('REINSTALL: the pulse says it too, since nothing it does can fix it', /directory still holds a different key for rio@mazel/.test(warnedOnPulse), warnedOnPulse.replace(/\n/g, ' ').slice(0, 110));
+  const again = await call(NEW, 'pulse');
+  ok('REINSTALL: said once a day, not every half hour', !/directory still holds a different key/.test(again), again.slice(0, 50));
+  ok('REINSTALL: and the directory still names the first portal, untouched',
+     JSON.parse(renv.RELAY.m.get('dir:rio')).publicKey === JSON.parse(portals[OLD].MAILBOX.m.get('config:signing')).pub, 'the old key stands');
+}
+
+// ---- a nudge about someone you know says their name ------------------------------------------
+// A branch with a contact has a name and no handle, because there is no portal on the other side.
+// The reminder mapped handles only, so for three days a real box read "You are the one to write
+// first to , and it has been 3 days."
+{
+  const NU = 'https://mazel.nudge.gh', NP = 'https://mazel.nudge-peer.gh';
+  portals[NU] = { HANDLE:'nia2@mazel', PERSONA:'Nia needs a cooper.', NEED:'', HAVE:'barrels', INBOX_TOKEN:'tnu', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: NU };
+  portals[NP] = { HANDLE:'pim@mazel', PERSONA:'Pim makes barrels.', NEED:'', HAVE:'coopering', INBOX_TOKEN:'tnp', MAILBOX: mkKV(), RELAY_URL: R, PORTAL_ORIGIN: NP };
+  for (const o of [NU, NP]) await call(o, 'pulse');
+  await call(NU, 'contacts', { action: 'note', name: 'Bea Lindgren', org: 'lindgren.example', have: ['coopering'], witnesses: ['calendar'], small_meetings: 6, deals: 1, best_stage: 'won', threads_sent: 10, threads_replied: 8 });
+  await call(NU, 'update_card', { add_need: 'coopering', confirmed: true });
+  const f = JSON.parse(await call(NU, 'find', { need_text: 'a cooper for oak barrels', tags: ['coopering'] }));
+  ok('NUDGE: precondition - a branch opened with someone they know, who has no handle', (f.invites || []).some((i) => i.name === 'Bea Lindgren'), JSON.stringify((f.invites || []).map((i) => i.name)));
+  // Age the branch past the reminder mark and pulse.
+  for (const [k, v] of [...portals[NU].MAILBOX.m.entries()]) {
+    if (!k.startsWith('conv:')) continue;
+    const c = JSON.parse(v);
+    if (!(c.participants || []).some((p) => p.name === 'Bea Lindgren')) continue;
+    c.created = new Date(Date.now() - 4 * 86400000).toISOString();
+    c.state = 'open'; c.firstWriter = 'nia2@mazel'; c.timers = {};
+    portals[NU].MAILBOX.m.set(k, JSON.stringify(c));
+  }
+  const pulsed = await call(NU, 'pulse');
+  ok('NUDGE: the reminder names the person, not a blank', /write first to Bea Lindgren/.test(pulsed), (pulsed.match(/You are the one to write first to [^,]*,/) || ['no reminder'])[0]);
+  ok('NUDGE: and never says "write first to ," with nothing in it', !/write first to ,/.test(pulsed));
+}
+
 // ---- forgetting is always allowed ----
 const beforeForget = JSON.parse(await call(A, 'list_ghosts')).count;
 const one = JSON.parse(await call(A, 'list_ghosts')).people[0];

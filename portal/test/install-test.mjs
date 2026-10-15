@@ -190,7 +190,7 @@ globalThis.fetch = realFetch;
 {
   const listed = (await (await worker.fetch(new Request(`${O}/mcp?token=${freshReal}`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list' }) }), fresh)).json()).result.tools;
   const names = listed.map(t => t.name);
-  ok('nineteen tools are listed', names.length === 19, names.join(' '));
+  ok('twenty tools are listed', names.length === 20 && names.includes('tell'), names.join(' '));
   ok('the loop is on the list', ['my_card','update_card','find','propose_intro','respond_intro','check_mailbox','thread_list','thread_read','thread_send','thread_mark','inbox_link','list_intros'].every(n => names.includes(n)));
   ok('the four merged tools and more_tools are on it', ['contacts','tribe','cards','thread_manage','more_tools'].every(n => names.includes(n)));
   ok('the ChatGPT write path stays listed', names.includes('claim_link') && names.includes('respond_intro_link'));

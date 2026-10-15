@@ -207,8 +207,12 @@ export default {
       if (pub && pub.record && String(pub.record.handle || "").split("@")[0].toLowerCase() === rec[1].toLowerCase()) return json(pub.record);
       const card = await getCard(env);
       const local = card.handle.split("@")[0].toLowerCase();
-      if (rec[1].toLowerCase() !== local) return json({ error: "no such handle here", handle: rec[1] }, 404);
-      return json(await handleRecord(env, origin, card));
+      if (rec[1].toLowerCase() === local) return json(await handleRecord(env, origin, card));
+      // A name this portal answers for besides its own, signed under the alias so the directory can
+      // check that the portal claiming the name really serves it.
+      const alias = aliasHandles(env).find((h) => h.split("@")[0].toLowerCase() === rec[1].toLowerCase());
+      if (alias) return json(await handleRecord(env, origin, card, alias));
+      return json({ error: "no such handle here", handle: rec[1] }, 404);
     }
 
     if (url.pathname === "/card" && request.method === "POST") {
@@ -328,19 +332,24 @@ function parseMemory(md) {
     if (fm) { to = fm[1].trim().toLowerCase() || null; rest = rest.slice(0, fm.index).trim(); }
     const sm = rest.match(/\(seen:\s*([^)]*)\)\s*$/i);
     if (sm) { seenAt = sm[1].trim(); rest = rest.slice(0, sm.index).trim(); }
+    // An open door: anyone whose portal clears the gate may write to the owner about this need,
+    // with no introduction first. Needs are closed unless the line says otherwise.
+    let openDoor = false;
+    const om = rest.match(/\(open door\)\s*$/i);
+    if (om) { openDoor = true; rest = rest.slice(0, om.index).trim(); }
     const w = rest.match(/\(witnesses:\s*([^)]*)\)\s*$/i);
     if (w) { witnesses = w[1].split(",").map((x) => x.trim().toLowerCase()).filter(Boolean); rest = rest.slice(0, w.index).trim(); }
     const [tagPart, ...glossParts] = rest.split(/\s+[-\u2014]\s+/);
     const tag = normalizeTag(tagPart);
     if (!tag) { mem.unparsed.push(line); continue; }
-    const item = { tag, tier, gloss: glossParts.join(" - ").trim(), witnesses, seenAt, ...(to ? { to } : {}) };
+    const item = { tag, tier, gloss: glossParts.join(" - ").trim(), witnesses, seenAt, ...(to ? { to } : {}), ...(openDoor ? { open: true } : {}) };
     (section === "have" ? mem.have : mem.need).push(item);
   }
   return mem;
 }
 
 function serializeMemory(mem) {
-  const line = (i) => `- [${i.tier}] ${i.tag}${i.gloss ? ` - ${i.gloss}` : ""}${i.witnesses && i.witnesses.length ? ` (witnesses: ${i.witnesses.join(", ")})` : ""}${i.seenAt ? ` (seen: ${i.seenAt})` : ""}${i.to ? ` (for: ${i.to})` : ""}`;
+  const line = (i) => `- [${i.tier}] ${i.tag}${i.gloss ? ` - ${i.gloss}` : ""}${i.witnesses && i.witnesses.length ? ` (witnesses: ${i.witnesses.join(", ")})` : ""}${i.seenAt ? ` (seen: ${i.seenAt})` : ""}${i.to ? ` (for: ${i.to})` : ""}${i.open ? " (open door)" : ""}`;
   const persona = TIER_ORDER.filter((t) => mem.persona[t]).map((t) => `- [${t}] ${mem.persona[t]}`);
   return [
     MEMORY_HEADER(mem.handle),
@@ -369,7 +378,7 @@ function cardFromMemory(mem) {
     haveTier: Object.fromEntries(mem.have.map((h) => [h.tag, h.tier])),
     witnesses: Object.fromEntries([...mem.have, ...mem.need].map((i) => [i.tag, i.witnesses || []])),
     seenAt: Object.fromEntries([...mem.have, ...mem.need].filter((i) => i.seenAt).map((i) => [i.tag, i.seenAt])),
-    need: mem.need.map((n) => ({ tag: n.tag, visibility: n.tier, ...(n.to ? { to: n.to } : {}) })),
+    need: mem.need.map((n) => ({ tag: n.tag, visibility: n.tier, ...(n.to ? { to: n.to } : {}), ...(n.open ? { open: true } : {}) })),
     glosses,
   };
 }
@@ -383,7 +392,7 @@ function memoryFromCard(card) {
     // never be witness-free, so "a have nobody has vouched for stays inside the portal" was
     // unreachable: the owner witness is added when the person confirms, and only then.
     have: (card.have || []).map((tag) => ({ tag, tier: (card.haveTier || {})[tag] || "public", gloss: (card.glosses || {})[tag] || "", witnesses: (card.witnesses || {})[tag] || [], seenAt: (card.seenAt || {})[tag] || null })),
-    need: (card.need || []).map((n) => ({ tag: n.tag, tier: n.visibility || "public", gloss: (card.glosses || {})[n.tag] || "", witnesses: (card.witnesses || {})[n.tag] || [], seenAt: (card.seenAt || {})[n.tag] || null, ...(n.to ? { to: n.to } : {}) })),
+    need: (card.need || []).map((n) => ({ tag: n.tag, tier: n.visibility || "public", gloss: (card.glosses || {})[n.tag] || "", witnesses: (card.witnesses || {})[n.tag] || [], seenAt: (card.seenAt || {})[n.tag] || null, ...(n.to ? { to: n.to } : {}), ...(n.open ? { open: true } : {}) })),
     unparsed: card.unparsed || [],
   };
 }
@@ -640,16 +649,21 @@ function applyCardChange(card, args) {
       .map((w) => String(w).trim().toLowerCase()).filter(Boolean).slice(0, 8);
     if (visibility === "directed" && !directedTo) throw new Error("a directed need needs need_to: the handle of the person it is for");
     if (directedTo && visibility !== "directed") throw new Error("need_to only applies to a directed need");
+    // An open door is the owner saying: anyone may write to me about this one, no introduction
+    // first. It only makes sense on a need strangers can see, and it is theirs to switch off.
+    const wantsOpen = args.open_door === true;
+    if (wantsOpen && visibility !== "public") throw new Error("an open door only makes sense on a public need: a need nobody can see is not one anybody can write to you about");
     for (const tag of tags) {
       const existing = next.need.find((n) => n.tag === tag);
       if (existing) {
         if (existing.visibility === "public" || visibility === "public") publicChanged = true;
         existing.visibility = visibility;
         if (directedTo) existing.to = directedTo; else delete existing.to;
+        if (args.open_door !== undefined) { if (wantsOpen) existing.open = true; else delete existing.open; publicChanged = true; }
       } else {
         const publicCount = next.need.filter((n) => n.visibility === "public").length;
         if (visibility === "public" && publicCount >= MAX_TAGS) throw new Error(`need already has ${MAX_TAGS} public tags; remove one first`);
-        next.need.push({ tag, visibility, ...(directedTo ? { to: directedTo } : {}) });
+        next.need.push({ tag, visibility, ...(directedTo ? { to: directedTo } : {}), ...(wantsOpen ? { open: true } : {}) });
         if (visibility === "public") publicChanged = true;
       }
       // Where the need was read from, the same way a have records it. Without this a need added in
@@ -657,7 +671,7 @@ function applyCardChange(card, args) {
       next.witnesses = { ...(next.witnesses || {}) };
       next.witnesses[tag] = [...new Set([...(next.witnesses[tag] || []), ...needWitnesses, ...(args.confirmed === true ? [OWNER_WITNESS] : [])])];
       if (needWitnesses.length) { next.seenAt = { ...(next.seenAt || {}) }; next.seenAt[tag] = new Date().toISOString().slice(0, 10); }
-      changes.push(`need + ${tag} (${visibility}${directedTo ? `, for ${directedTo}` : ""})`);
+      changes.push(`need + ${tag} (${visibility}${directedTo ? `, for ${directedTo}` : ""}${(next.need.find((n) => n.tag === tag) || {}).open ? ", open door: anyone may write to you about this one" : ""})`);
     }
   }
   if (args.gloss_tag) {
@@ -835,7 +849,7 @@ async function handleSend(request, env) {
   // and a JSON-RPC error so an honest sender's outbox knows the door did not take it (29f M2). A
   // plain note with no signature is taken as mail from nobody in particular: stored, fenced, and
   // never attributed to the handle it names.
-  const GATED = ["find.hit", "find.blind", "need.offer", "intro.propose", "intro.respond", "tribe.roster", "thread.open"];
+  const GATED = ["find.hit", "find.blind", "need.offer", "door.message", "intro.propose", "intro.respond", "tribe.roster", "thread.open"];
   let sender = null;
   if (GATED.includes(action.type) || (action.type === "note" && action.sig)) {
     const claimed = action.type === "intro.propose" && action.proposer ? action.proposer : action;
@@ -857,13 +871,14 @@ async function handleSend(request, env) {
   record.fromCard = sender ? sender.cardUrl || fromCard : fromCard;
 
   await applyInboundAction(env, action, record, new URL(request.url).origin);
+  if (record.refuse) { const r = record.refuse; delete record.refuse; delete record.sender; return rpcError(id, r.code, r.msg); }
   delete record.sender;
   // What the mailbox keeps of an intro's path is the one name that signed it (29f M1).
   if ((action.type === "intro.propose" || action.type === "intro.respond") && Array.isArray(action.path)) record.action = { ...action, path: [record.fromHandle] };
   const ackId = crypto.randomUUID();
   // An offer is not mail. It is read, scored against the people this portal's owner knows, and
   // either becomes one question for them or nothing at all; the caster gets the same ack either way.
-  if (THREAD_ACTIONS.includes(action.type) || action.type === "need.offer") {
+  if (THREAD_ACTIONS.includes(action.type) || action.type === "need.offer" || action.type === "door.message") {
     if (incomingId) await env.MAILBOX.put(`seen:${incomingId}`, ackId, { expirationTtl: TTL });
     return json(ack(ackId));
   }
@@ -945,7 +960,8 @@ async function handleClear(request, env) {
 const MCP_TOOLS = [
   {
     name: "my_card",
-    description: "MAZEL: use when they say 'my mazel card', 'what does my mazel say', 'my mazel key'. Show this person's own card as the owner sees it: every tier, every witness, and identity - the signing key id, public key, rotation count, and where the signed handle record is served. The key is the identity; the handle is a label.",
+    description:
+      "MAZEL: also the answer to \"mazel\" on its own and to \"mazel help\": read back the `you_can_say` list, as a short list and nothing more. " + "MAZEL: use when they say 'my mazel card', 'what does my mazel say', 'my mazel key'. Show this person's own card as the owner sees it: every tier, every witness, and identity - the signing key id, public key, rotation count, and where the signed handle record is served. The key is the identity; the handle is a label.",
     inputSchema: { type: "object", properties: {} },
     annotations: { readOnlyHint: true },
   },
@@ -1020,6 +1036,26 @@ const MCP_TOOLS = [
     name: "pulse",
     description: "MAZEL: use when they say 'pulse my mazel', 'run my mazel', or on the scheduled check. One cast per open public need to the relay, one search over what it holds, one badge line; quiet when nothing hit. Also refreshes the card cast and the directory record. Runs every 30 minutes on its own.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "tell",
+    description:
+      "MAZEL: write to someone about a need they have left open to anyone, with no introduction first. " +
+      "With no `to`, this goes to Mazel itself about the product, which is the door Mazel leaves open: use it when the person says something about Mazel rather than about their work. " +
+      "FEEDBACK: when they say something did not work, or \"I wish mazel could ...\", or they paste an error, show them the exact text you would send and ask once, \"Send this to Mazel?\" Only on yes, call this with confirmed: true. Never send without asking, and never send anything they did not say. " +
+      "TWO FIELDS, NEVER ONE. `words` is their own text, exactly as they typed it: do not tidy it, shorten it, translate it or turn it into a report. It is signed as written and the person on the other end reads it as theirs. `agent_note` is yours, and only for what you tried and what you got back - the tool you called, the error text, the version. It is labelled as the agent's on the other side. " +
+      "A need that is not open refuses this and says so; so does a message over the day's limit, and then you keep the words and offer to send them tomorrow. CONFIRM FIRST.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        words: { type: "string", description: "The person's own text, exactly as they typed it. Never your summary of it." },
+        agent_note: { type: "string", description: "Yours, not theirs: what you tried, the tool you called, the error you got, the version. Optional." },
+        to: { type: "string", description: "The handle whose open need this is about. Leave it out to write to Mazel about Mazel." },
+        need: { type: "string", description: "The need tag they left open. Leave it out when writing to Mazel." },
+        confirmed: { type: "boolean", description: "true once the person has seen the exact words and said send it" },
+      },
+      required: ["words"],
+    },
   },
   {
     name: "migrate_store",
@@ -1517,6 +1553,14 @@ const peerFence = (v) => {
 // against: a record naming a system someone supports, turned by the agent into a claim that they
 // own that system and decide what runs through it, which nobody had written anywhere and which may
 // simply be untrue.
+// When the person is talking about Mazel rather than about their work. An agent that lets this pass
+// loses the only thing that tells anyone what is wrong with the product.
+const FEEDBACK_RULE =
+  "ABOUT MAZEL ITSELF: when they say something did not work, or \"I wish mazel could ...\", or they " +
+  "paste an error, or they are plainly confused by this, that is feedback. Show them the exact text " +
+  "you would send, ask once, \"Send this to Mazel?\", and only on yes call `tell` with confirmed: " +
+  "true and their words unchanged. Never send without asking, never send your own summary of what " +
+  "they said, and never ask twice about the same thing.";
 const RECORD_ONLY_RULE =
   "RECORD ONLY: say what the record holds and nothing beyond it. The tags, the role line, the " +
   "witnesses and the counts are the whole of what is known about this person here. Do not say what " +
@@ -1534,6 +1578,7 @@ const FIRST_CONTACT_HINT =
 for (const t of MCP_TOOLS) {
   if (["check_mailbox", "find", "send_to_peer", "list_known_cards", "list_intros", "add_known_card", "list_threads", "cards", "thread_list", "contacts"].includes(t.name)) t.description += " " + UNTRUSTED_RULE;
   if (["find", "contacts", "list_ghosts", "note_ghost"].includes(t.name)) t.description += " " + RECORD_ONLY_RULE;
+  if (["my_card", "check_mailbox", "find", "update_card", "thread_send"].includes(t.name)) t.description += " " + FEEDBACK_RULE;
   if (["respond_intro", "propose_intro", "check_mailbox", "respond_intro_link", "route_ghost"].includes(t.name)) t.description += " " + WRITEBACK_RULE;
   if (["my_card", "check_mailbox", "pulse", "find"].includes(t.name)) t.description += " " + QUIET_RULE;
   if (["my_card", "check_mailbox"].includes(t.name)) t.description += " " + FIRST_CONTACT_HINT;
@@ -1613,7 +1658,7 @@ async function callTool(name, args, env, origin, viaMerged = false) {
   if (name === "my_card") {
     if (!(await isClaimed(env))) return FIRST_CONTACT(origin);
     const card = await getCard(env);
-    return JSON.stringify({ ...ownerCard(card, origin), witnessCheck: await witnessCheck(env, card), identity: JSON.parse(await myIdentity(env, origin)) }, null, 2);
+    return JSON.stringify({ ...ownerCard(card, origin), you_can_say: youCanSay(), witnessCheck: await witnessCheck(env, card), identity: JSON.parse(await myIdentity(env, origin)) }, null, 2);
   }
 
   if (name === "claim_link") {
@@ -2147,6 +2192,58 @@ async function callTool(name, args, env, origin, viaMerged = false) {
     return `Show these words to the person, let them edit them, and let them send it however they like. Nothing leaves this portal.${!spent.repeat && spent.used >= 40 ? ` (${spent.used} drafted from this portal today: if that is not what the person is doing, something is looping.)` : ""}\n\n${inviteText(me, g, needText, matched, tribe)}`;
   }
 
+  if (name === "tell") {
+    // Where Mazel's own door is. A setting, so anyone running their own Mazel network points it at
+    // their own portal rather than at ours.
+    const set = String(env.FEEDBACK_HANDLE ?? "").trim().toLowerCase();
+    // FEEDBACK_HANDLE=none turns the door off, the same word RELAY_URL uses for the same purpose.
+    const feedbackTo = set === "none" ? "" : (set || FEEDBACK_HANDLE_DEFAULT);
+    if (!args.to && !feedbackTo) {
+      throw new Error("this portal has no feedback door set, so there is nowhere to send this. Tell the person their words were not sent and keep them. Whoever runs this Mazel network sets FEEDBACK_HANDLE when the portal is deployed.");
+    }
+    const to = String(args.to || feedbackTo).trim().toLowerCase();
+    const tag = normalizeTag(args.need || (to === feedbackTo && !args.to ? FEEDBACK_NEED : ""));
+    if (!tag) throw new Error("which need is this about? pass need, or leave both to and need out to write to Mazel about Mazel");
+    const words = String(args.words || "");
+    if (!words.trim()) throw new Error("words is the person's own text, and it is the one thing this cannot do without");
+    if (words.length > DOOR_WORDS_MAX) throw new Error(`that is ${words.length} characters and an open door takes ${DOOR_WORDS_MAX}. Nothing was sent.`);
+    const note = String(args.agent_note || "").slice(0, DOOR_NOTE_MAX);
+    const me = await getCard(env);
+    if (to === String(me.handle || "").toLowerCase()) throw new Error("that is your own handle; this is for writing to somebody else");
+    // Nothing goes until the person has seen the exact words. The words are quoted back here so the
+    // agent shows them what will be sent rather than its own description of it.
+    if (args.confirmed !== true) {
+      return `Not sent. This is what would go to ${to} about ${tag}, as their own words:\n\n"${words}"\n` +
+        (note.trim() ? `\nAnd this, labelled as yours and not theirs: "${note}"\n` : "") +
+        `\nShow them exactly that and ask once: "Send this to Mazel?" if it is Mazel, or "Send this to ${to}?" otherwise. Only on yes, call again with confirmed: true. Do not change a word of it.`;
+    }
+    // The door for a handle comes from the card this portal holds, or from the directory's record
+    // for it, and nothing else. A project handle like the feedback door has a record and no card of
+    // its own, because the portal answering for it serves its own card under its own name. So the
+    // record's door is the door, and no card is pinned under a name nobody holds.
+    let rpc = await doorFor(env, to);
+    if (!rpc) {
+      try {
+        const rec = await resolveHandle(env, to);
+        if (rec && rec.rpc) rpc = rec.rpc;
+      } catch (e) {
+        throw new Error(`this portal cannot find a door for ${to}: ${e.message}. Nothing was sent, and the words are still the person's to keep.`);
+      }
+    }
+    if (!rpc) throw new Error(`the directory has no door for ${to}. Nothing was sent; the words are still the person's to keep.`);
+    // The key is left out entirely when there is no note. A field set to undefined is signed as
+    // present and dropped in transit, so the far side canonicalises a different object and the
+    // signature never matches.
+    const action = await signedCast(env, origin, { type: "door.message", needTag: tag, words, to, ...(note.trim() ? { agentNote: note } : {}) });
+    const r = await postTo(env, origin, rpc, `A message about ${tag}, through the door you left open.`, { ...action, v: 1 }, null);
+    if (!r.ok) {
+      // A refusal from the far side is the person's answer, not an error to swallow: say it back in
+      // their words and keep theirs.
+      return `Not delivered. ${to}'s portal said: ${r.reason || "no reason given"}\n\nThe words are still yours to keep:\n\n"${words}"\n\nIf it was today's limit, offer to send it tomorrow. Do not reword it.`;
+    }
+    return `Sent to ${to} about ${tag}, in their own words and nothing else. ${note.trim() ? "Your note went with it, labelled as yours. " : ""}If ${to} replies it arrives in this person's mazel as an ordinary message.`;
+  }
+
   if (name === "migrate_store") {
     if (!env.PORTAL) throw new Error("this portal has no storage object bound; deploy the current code first, which binds it");
     // The real KV namespace, whichever way round this env is: when the portal is already on the
@@ -2245,6 +2342,18 @@ async function callTool(name, args, env, origin, viaMerged = false) {
       return `Not written. This changes the public card (${summary}). Show the change to the person, get a yes, then call again with confirmed: true.`;
     }
     await saveCard(env, card, origin);
+    // Once per portal, on the first card the owner confirms, whether or not that write is the one
+    // that claims it: a portal that predates the claim has an owner who has never been told either.
+    // The warning goes first and in prose, because it is the one thing the person has to hear
+    // before anything else. The list goes last, as data, so the sentence the agent reads back is
+    // still the first thing in the result.
+    let sayFirst = "", sayLast = "";
+    if (!(await env.MAILBOX.get("config:said-what-you-can-say"))) {
+      await env.MAILBOX.put("config:said-what-you-can-say", new Date().toISOString());
+      const clash = await keyMismatch(env);
+      if (clash) sayFirst = `TELL THEM THIS FIRST: ${mismatchWords(clash)}\n\n`;
+      sayLast = "\n\n" + JSON.stringify({ you_can_say: youCanSay(), ...(clash ? { tell_them_first: mismatchWords(clash) } : {}) }, null, 2);
+    }
     const written = args.add_need ? tagList(args.add_need) : [];
     const answered = written.length ? Object.values(await pendingNeeds(env)).filter((p) => written.includes(p.tag)) : [];
     await settleWhereItLives(env, written, origin);
@@ -2261,9 +2370,10 @@ async function callTool(name, args, env, origin, viaMerged = false) {
       // First write: the portal belongs to someone. The setup key dies here, so whatever a
       // passer-by read off the welcome page during the window stops working now.
       await claimPortal(env);
-      return `Written: ${summary}. This portal is ${card.handle} from now on, and its card is live at ${origin}/card.\n\nThe setup key just stopped working. Give the person their real connector link and ask them to replace the one they pasted:\n\n    ${origin}/mcp?token=${await getToken(env)}\n\n\nSay this once, then go quiet: their card is live, and their public needs start travelling to strangers on the next pulse (within half an hour).\n` + JSON.stringify(ownerCard(card, origin), null, 2);
+      return sayFirst +
+        `Written: ${summary}. This portal is ${card.handle} from now on, and its card is live at ${origin}/card.\n\nThe setup key just stopped working. Give the person their real connector link and ask them to replace the one they pasted:\n\n    ${origin}/mcp?token=${await getToken(env)}\n\n\nSay this once, then go quiet: their card is live, and their public needs start travelling to strangers on the next pulse (within half an hour).\n` + JSON.stringify(ownerCard(card, origin), null, 2) + sayLast;
     }
-    return `Written: ${summary}. Live now at ${origin}/card.${where}\n` + JSON.stringify(ownerCard(card, origin), null, 2);
+    return sayFirst + `Written: ${summary}. Live now at ${origin}/card.${where}\n` + JSON.stringify(ownerCard(card, origin), null, 2) + sayLast;
   }
 
   if (name === "check_mailbox") {
@@ -2487,16 +2597,29 @@ async function signPayload(env, payload) {
   return { ...payload, sig: b64u(sig), kid: s.kid };
 }
 
+// Names besides this portal's own that it answers for. A project handle like feedback@mazel is one
+// of these: the directory's owner points it at whichever portal should receive that mail, and the
+// portal proves it by serving and signing the record for that name. ALIAS_HANDLES is a deploy
+// variable, so no address is ever a literal in here.
+const aliasHandles = (env) => String(env.ALIAS_HANDLES || "")
+  .split(",").map((h) => h.trim().toLowerCase()).filter((h) => /^[a-z0-9][a-z0-9._-]*@[a-z0-9.-]+$/.test(h)).slice(0, 8);
+const answersFor = async (env, handle) => {
+  const want = String(handle || "").trim().toLowerCase();
+  if (!want) return false;
+  const me = String((await getCard(env)).handle || "").toLowerCase();
+  return want === me || aliasHandles(env).includes(want);
+};
+
 // The signed handle record: what /.well-known/mazel/<name>.json serves, and what gets published
 // to the relay's directory for name@mazel. Holds public key, portal url, timestamp.
-async function handleRecord(env, origin, card) {
+async function handleRecord(env, origin, card, asHandle = null) {
   const s = await getSigning(env);
   // No email bucket. It was published as k-anonymous; measured against a twelve-address shortlist
   // for one named person, exactly one survived - the right one. That is a membership test on a
   // guessed address, not anonymity, and no salt fixes it because the salt would have to be public
   // to be usable. Resolution waits for real private set intersection (§6.5).
   const payload = {
-    v: 1, handle: card.handle, publicKey: s.pub, cardUrl: `${origin}/.well-known/agent-card.json`, rpc: `${origin}/a2a`,
+    v: 1, handle: asHandle || card.handle, publicKey: s.pub, cardUrl: `${origin}/.well-known/agent-card.json`, rpc: `${origin}/a2a`,
     timestamp: new Date().toISOString(), rotations: s.rotations,
   };
   return signPayload(env, payload);
@@ -2693,7 +2816,7 @@ async function postTo(env, origin, rpc, text, action, inReplyTo) {
 
 // ---------------------------------------------------------------------------
 // Crawl Stage 1: typed actions, known cards, threads, intros.
-const ACTION_TYPES = ["note", "find.hit", "find.blind", "need.offer", "intro.propose", "intro.respond", "tribe.roster", "thread.message", "thread.close", "thread.open"];
+const ACTION_TYPES = ["note", "find.hit", "find.blind", "need.offer", "door.message", "intro.propose", "intro.respond", "tribe.roster", "thread.message", "thread.close", "thread.open"];
 // What an unauthenticated door will do for strangers in a day. A find.request makes this portal
 // send: one answer to the asker, and one forward to each known card. Without a ceiling, one remote
 // caller turns a portal into a mailing list for whoever they point it at.
@@ -2725,6 +2848,45 @@ const fresh = (at) => {
   return age > -60000 && age < CAST_FRESH_MS;   // small tolerance for clock skew, no future-dating
 };
 const MAX_TEXT = 4000;
+// Mazel's own open door. The handle is a deploy variable and never a literal in here: a portal is
+// shipped to everyone and no person's address belongs in a file strangers install. The installer
+// sets FEEDBACK_HANDLE; a portal without one simply has no feedback door, and says so.
+const FEEDBACK_HANDLE_DEFAULT = "feedback@mazel";
+const FEEDBACK_NEED = "mazel-product-feedback";
+
+// What a person can say to their own agent. One list, because a portal nobody knows how to talk to
+// is a portal nobody talks to. Said once when the card is written, and again whenever they ask.
+const YOU_CAN_SAY = [
+  '"show my mazel card"',
+  '"mazel, I need ..."',
+  '"change something on my card"',
+  '"check my mazel"',
+  '"send feedback to Mazel"',
+];
+const youCanSay = () => ({
+  say_this_once: "Tell them, as a short list and nothing more, that from now on they can say:",
+  lines: YOU_CAN_SAY,
+  then: "Then stop. Do not explain the list, do not add to it, and do not repeat it unless they ask.",
+});
+
+// Does this portal's own directory record name this portal's own key? After a reinstall it does
+// not: the old portal's key is still there, no signed chain leads from it to the new one, and every
+// peer that looks the owner up refuses their card. Nothing about identity changes here; the owner
+// is simply told, because the alternative is being invisible and not knowing.
+async function keyMismatch(env) {
+  const card = await getCard(env);
+  if (!card.handle) return null;
+  let rec = null;
+  try { rec = await resolveHandle(env, card.handle); } catch { return null; }
+  if (!rec || !rec.publicKey) return null;
+  const mine = (await getSigning(env)).pub;
+  if (rec.publicKey === mine) return null;
+  return { handle: card.handle, theirs: String(rec.publicKey).slice(0, 12), mine: String(mine).slice(0, 12) };
+}
+const mismatchWords = (m) =>
+  `The Mazel directory still holds a different key for ${m.handle} than this portal's own, so other people's agents will refuse your card and nobody will tell you why. ` +
+  `This happens when a handle has been used by an earlier portal. Two ways out: open this portal again under a handle nobody has used, which cannot go wrong, or ask Mazel to clear the old record for ${m.handle} and then run a pulse. ` +
+  `Nothing else about your portal is affected, and nothing you have said to anyone is lost.`;
 const MAX_BODY_BYTES = 32 * 1024;
 
 // A rolling daily counter in KV, self-expiring. Approximate under concurrency, which is fine:
@@ -2943,6 +3105,10 @@ const ACTION_FIELDS = {
   "find.blind": [...SIGNED_ENVELOPE, "needId", "fp", "castAt"],
   // No path and no hops: an offer is one hop by construction, and there is nothing in it to forward.
   "need.offer": [...SIGNED_ENVELOPE, "castAt", "needId", "tier", "needText", "needTags", "fp", "to"],
+  // A message through an open door. `words` is the sender's own person, typed by them and signed as
+  // it was typed; `agentNote` is their agent's, and is labelled as such on the other side. The need
+  // tag is in the signature, so a message cannot be re-aimed at a need the owner never opened.
+  "door.message": [...SIGNED_ENVELOPE, "castAt", "needTag", "words", "agentNote", "to"],
   "find.hit": [...SIGNED_ENVELOPE, "needId", "blind", "overlap", "castAt"],
   "intro.propose": [...SIGNED_ENVELOPE, "castAt", "introId", "proposer", "why", "needText", "needTags", "matchedTags", "path", "origin", "tribeId", "tribeName", "ask", "contextId"],
   "intro.respond": [...SIGNED_ENVELOPE, "castAt", "introId", "decision", "note", "path", "contextId"],
@@ -3602,6 +3768,13 @@ async function findInKnownCards(env, origin, args) {
   }
   // Where this need lives. A need already on the card, at any tier, is settled and nothing is
   // asked; anything else is the person's to decide, and the asking does not stop until they have.
+  // Once, after the first thing this person ever looked for: one question about whether any of this
+  // made sense. Skipped is skipped; the flag is written either way so it cannot come back.
+  let firstFind = false;
+  if (!(await env.MAILBOX.get("config:asked-confusing"))) {
+    await env.MAILBOX.put("config:asked-confusing", new Date().toISOString());
+    firstFind = true;
+  }
   const onCard = (await getCard(env)).need.map((n) => n.tag);
   const settled = needTags.some((t) => onCard.includes(t));
   const whereTag = needTags[0] || suggestTag(needWords);
@@ -3649,6 +3822,10 @@ async function findInKnownCards(env, origin, args) {
   // One shape for every answer: a headline to say out loud, plus the data.
   const base = { thread_id: thread.id, need_text: needText, tags: needTags, status: thread.status, reopened, expires: thread.expires,
     ...(pending ? { where_it_lives: whereItLivesAsk(pending) } : { where_it_lives: "settled: this need is on the card already" }),
+    ...(firstFind ? { ask_once: {
+      ask: "Anything confusing so far? I can send it to Mazel.",
+      how: "Ask it once, in your own turn, after you have shown them this result. If they say anything, send it with tell (words exactly as they say them). If they skip it or say no, drop it: this never comes back, and it is never put in their mazel.",
+    } } : {}),
     record_only: RECORD_ONLY_RULE,
     ...(invites.length ? { invites, invites_note: "People you already know who have no Mazel card. Nothing has been sent and their details have not left this portal. Show them to the person; on a yes, call invite_text(ghost_id, thread_id) and let them send it themselves." } : {}),
     ...(thread.castPending ? { world: "waiting", world_note: "The world has not been asked yet: the relay takes a set number of casts from one portal a day and this one is over it. The need is fine and nothing is lost - the next pulse after the day turns over sends it. Say it as waiting, never as an error." } : {}),
@@ -3803,6 +3980,7 @@ async function proposeIntro(env, origin, args) {
 async function applyInboundAction(env, action, record, origin) {
   if (action.type === "find.hit") await onBlindHit(env, origin, action, record);
   if (action.type === "need.offer") await onNeedOffer(env, origin, action, record);
+  if (action.type === "door.message") await onDoorMessage(env, origin, action, record);
   if (action.type === "find.blind") await onFindBlind(env, origin, action, record);
   if (action.type === "tribe.roster") await onTribeRoster(env, origin, action, record.sender);
   // Fresh, like every other signed action: a captured thread.close is not a standing order.
@@ -4247,7 +4425,13 @@ async function castCard(env, origin) {
 
 async function publishRecord(env, origin) {
   const card = await getCard(env);
-  return relayPost(env, "/publish", await handleRecord(env, origin, card));
+  const r = await relayPost(env, "/publish", await handleRecord(env, origin, card));
+  // And every name this portal also answers for. Each is its own signed record under its own name;
+  // the directory accepts it on the same terms as any other, which is that this portal serves it.
+  for (const alias of aliasHandles(env)) {
+    try { await relayPost(env, "/publish", await handleRecord(env, origin, card, alias)); } catch { /* the next pulse tries again */ }
+  }
+  return r;
 }
 
 // Search the relay for a public need; results become world-tier known cards and thread candidates.
@@ -5273,7 +5457,10 @@ async function sweepThreads(env, origin) {
   const followup = daysCfg(env, "THREAD_FOLLOWUP_DAYS", THREAD_FOLLOWUP_DAYS_DEFAULT) * day;
   for (const conv of await listConvs(env)) {
     const me = conv.participants.find((p) => p.me);
-    const other = conv.participants.filter((p) => !p.me).map((p) => p.handle).join(", ");
+    // A branch with someone the owner knows has a name and no handle, because there is no portal on
+    // the other side. Mapping handles alone left the nudge reading "write first to , and it has
+    // been 3 days", which is what it said in a real box for three days.
+    const other = conv.participants.filter((p) => !p.me).map((p) => p.handle || p.name || "someone you know").join(", ");
     const age = now - Date.parse(conv.created);
     // A lapse is the day-14 timeout on a first message that never went (§4.3b). Each side's own
     // clock says so; nothing crosses the wire for it, so nobody can be told a lie about it.
@@ -5420,13 +5607,24 @@ const partText = (p) => p.text != null ? p.text : p.file ? `[file: ${p.file.name
 
 async function inboxListPage(env, origin, sess) {
   const convs = await listConvs(env);
-  const me = (await getCard(env)).handle;
+  const card = await getCard(env);
+  const me = card.handle;
+  // The person's own card, on their own page: the thing they are most likely to want to check and
+  // the one thing they could not see here before.
+  const openNeeds = (card.need || []).filter((n) => n.visibility === "public");
+  const cardBlock = `<section class="note" style="border:1px solid #e6e1d8;border-radius:10px;padding:.85rem 1rem;margin:.5rem 0 1.25rem">
+<b>Your card</b><br>${esc(card.description || "No persona yet.")}
+${(card.have || []).length ? `<br><br><b>You have</b>: ${esc((card.have || []).join(", "))}` : ""}
+${openNeeds.length ? `<br><b>You are looking for</b>: ${openNeeds.map((n) => esc(n.tag) + (n.open ? " (open to anyone)" : "")).join(", ")}` : ""}
+${(card.need || []).some((n) => n.visibility !== "public") ? `<br><b>Held back</b>: ${(card.need || []).filter((n) => n.visibility !== "public").length} need(s), which travel as a fingerprint and never as words` : ""}
+<br><br>To change any of it, tell your AI what to change.</section>`;
   const rows = convs.map((c) => `<a class="row" href="/inbox/t/${esc(c.contextId)}">${c.unread ? '<span class="dot"></span>' : ""}<b>${esc(whoLine(c))}</b><small>${esc(c.state)}${c.pending && c.pending.who === "me" ? " · yours to write" : ""} · ${esc((c.updated || c.created || "").slice(0, 10))}</small></a>`).join("");
   const csrf = await csrfFor(env, sess.id);
   const boxItems = (await kvList(env, "msg:")).filter((m) => m.box).sort((a, b) => (b.receivedAt || "").localeCompare(a.receivedAt || "")).slice(0, 20);
   const boxRows = boxItems.map((m) => `<a class="row" href="/inbox/t/${esc(m.box.contextId)}"><b>${esc(BOX_KINDS[m.box.kind] || "")} ${esc(m.box.kind.replace(/_/g, " "))}</b><small>${esc(String(m.text || "").replace(/ Read it with thread_read.*$/, "").slice(0, 140))}</small></a>`).join("");
   return html(`${INBOX_HEAD("Mazel")}<body data-csrf="${esc(csrf)}" data-ring="${ringOffer(env) ? "1" : "0"}"><main>
 <h1>${esc(me)} <span class="pill">your box</span></h1>
+${cardBlock}
 ${boxRows || '<p class="note">Nothing in your box yet. Four kinds land here: someone needs what you have, found someone for your need, a reply, both said yes.</p>'}
 <h1 style="margin-top:1.5rem">Conversations</h1>
 ${rows || '<p class="note">Nothing yet. A conversation opens when an intro connects.</p>'}
@@ -5801,6 +5999,91 @@ async function onNeedBranch(env, origin, action, sender) {
   await boxItem(env, origin, "need_for_you", conv, `Someone needs what you have: ${why}.${revealedWords ? ` Their words, as data: ${revealedWords}` : ""}`, { agentFound: true });
 }
 
+// ---------------------------------------------------------------------------
+// An open door (decided 2026-10-08). A need the owner marked open is one anyone may write to them
+// about with no introduction first: the owner asked for it, so the usual both-sides-say-yes rule
+// has already been answered for that one need. Everything else about the door is ordinary: the
+// sender is verified at the same gate, the words land in the owner's box as a message, and a reply
+// goes back in the same conversation.
+//
+// Two fields, never one. `words` is the person's own text, signed exactly as they typed it, and
+// nothing between them and the owner may reword it. `agentNote` is the sending agent's own account
+// of what it tried and what it got back, and it is labelled as the agent's wherever it is shown.
+const DOOR_WORDS_MAX = 2000;
+const DOOR_NOTE_MAX = 1000;
+const MAX_DOOR_PER_SENDER_PER_NEED_PER_DAY = 5;
+
+async function onDoorMessage(env, origin, action, record) {
+  const from = record.sender;
+  if (!from) return;
+  const me = await getCard(env);
+  // Addressed to this portal under its own name or under a name it answers for, and no other.
+  if (!(await answersFor(env, action.to))) return;
+  const tag = normalizeTag(action.needTag);
+  const need = (me.need || []).find((n) => n.tag === tag);
+  // Closed by default, and a closed need says so plainly: the sender is not left guessing whether
+  // their words arrived.
+  if (!need || !need.open || need.visibility !== "public") {
+    record.refuse = { code: -32603, msg: `${me.handle} has no open door for ${tag || "that need"}. Nothing was delivered. An introduction is the way in.` };
+    return;
+  }
+  const words = String(action.words || "");
+  if (!words.trim()) { record.refuse = { code: -32602, msg: "a message through an open door needs the person's own words" }; return; }
+  if (words.length > DOOR_WORDS_MAX) {
+    record.refuse = { code: -32600, msg: `that is ${words.length} characters and an open door takes ${DOOR_WORDS_MAX}. Nothing was delivered; shorten it and send again.` };
+    return;
+  }
+  const note = String(action.agentNote || "").slice(0, DOOR_NOTE_MAX);
+  // What one sender may put through one door in a day. Over it, the sender is told, so their agent
+  // can keep the words for the person and offer them again tomorrow.
+  if (!(await underCap(env, `door:${String(from.handle).slice(0, 64)}:${tag}`, MAX_DOOR_PER_SENDER_PER_NEED_PER_DAY))) {
+    record.refuse = { code: -32600, msg: `that is today's ${MAX_DOOR_PER_SENDER_PER_NEED_PER_DAY} messages to ${me.handle} about ${tag}. Nothing was delivered. Keep the words for the person and offer to send them tomorrow.` };
+    return;
+  }
+  // One conversation per sender per door, named after the need, so a second message continues the
+  // first rather than starting a pile.
+  const contextId = await stableId("door", tag, String(from.handle).toLowerCase());
+  let conv = await loadConv(env, contextId);
+  if (!conv) {
+    conv = { contextId, participants: [
+        { handle: me.handle, publicKey: (await getSigning(env)).pub, me: true, role: "need" },
+        { handle: from.handle, publicKey: from.publicKey, me: false, role: "have" }],
+      origin: { kind: "door", needTag: tag, needId: null, theirNeedId: null, introId: null, via: "open-door" },
+      branch: false, humans: true, needTier: "public", state: "open", blocked: false,
+      firstWriter: from.handle, seq: 0, created: new Date().toISOString(), pending: null, timers: {}, unread: 0,
+      title: `about ${tag}` };
+  }
+  if (conv.blocked) { record.refuse = { code: -32603, msg: "that door does not take messages from that portal" }; return; }
+  // A verified rotation moves the participant's key with it, as everywhere else.
+  const them = conv.participants.find((pp) => !pp.me);
+  if (them && from.publicKey && them.publicKey !== from.publicKey) them.publicKey = from.publicKey;
+  const at = new Date().toISOString();
+  conv.seq = (conv.seq || 0) + 1;
+  await keep(env, seqKey(contextId, conv.seq), { seq: conv.seq, at, dir: "in", author: "human",
+    message: { messageId: `door-${conv.seq}-${contextId.slice(0, 8)}`, contextId, taskId: "", role: "ROLE_USER",
+      parts: [{ text: words }], metadata: { haah: { author: "human", from: from.handle, at, envelope: null }, action: { type: "door.message", v: 1 } },
+      extensions: [HAAH_URI], referenceTaskIds: [] } });
+  // The agent's note is its own entry, authored by the agent, so nothing it wrote can be read back
+  // as something the person said.
+  if (note.trim()) {
+    conv.seq += 1;
+    await keep(env, seqKey(contextId, conv.seq), { seq: conv.seq, at, dir: "in", author: "agent",
+      message: { messageId: `door-note-${conv.seq}-${contextId.slice(0, 8)}`, contextId, taskId: "", role: "ROLE_AGENT",
+        parts: [{ text: note }], metadata: { haah: { author: "agent", from: from.handle, at, envelope: null }, action: { type: "door.message", v: 1 } },
+        extensions: [HAAH_URI], referenceTaskIds: [] } });
+  }
+  conv.lastHumanIn = at;
+  conv.lastHumanInFrom = from.handle;
+  if (conv.state === "open") { conv.state = "sent"; conv.sentAt = at; }
+  else if (conv.state === "sent" && conv.lastHumanOut) { conv.state = "replied"; conv.repliedAt = at; }
+  conv.unread = (conv.unread || 0) + 1;
+  await saveConv(env, conv);
+  // The person's words are fenced wherever they are shown, like anything written by another portal.
+  await boxItem(env, origin, "reply", conv,
+    `${from.handle} wrote to you about ${tag}, which you left open to anyone. Their words: ${peerFence(words)}${note.trim() ? ` Their agent adds, as the agent: ${peerFence(note)}` : ""} Reply in this thread, or ignore it and nothing happens.`,
+    { collapse: conv.unread > 1 });
+}
+
 // A need offered by someone whose card this portal holds. Scored against the people the owner
 // already knows, and nothing else: if the owner's own card answered it, the caster would have found
 // them through find and opened a branch, so there is nothing for this path to add there.
@@ -6079,6 +6362,14 @@ async function runPulse(env, origin, how) {
   const released = await releaseQueue(env, origin);
   if (released.released) lines.push(`${released.released} invitation${released.released === 1 ? "" : "s"} you already approved ${released.released === 1 ? "is" : "are"} drafted and waiting in your mazel${released.left ? `, ${released.left} still in the queue` : ""}.`);
   if (released.lapsed) lines.push(`${released.lapsed} queued invitation${released.lapsed === 1 ? "" : "s"} sat untouched for a fortnight and lapsed.`);
+  // The reinstall check. Said once a day at most, and only while it is true.
+  if (!(await env.MAILBOX.get("config:key-mismatch-told"))) {
+    const clash = await keyMismatch(env);
+    if (clash) {
+      await env.MAILBOX.put("config:key-mismatch-told", new Date().toISOString(), { expirationTtl: 24 * 3600 });
+      lines.push(mismatchWords(clash));
+    }
+  }
   let casts = 0, hits = 0;
   // This run's whole allowance for offering needs to held cards, shared by every open need.
   const offerBudget = { left: OFFER_BATCH };
