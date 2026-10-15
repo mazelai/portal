@@ -1,10 +1,10 @@
 {
   "jsonrpc": "2.0",
-  "id": "fad92440bd92be02b853c0abd901cbea",
+  "id": "14053994d284e4e8e7289527a7693f93",
   "method": "SendMessage",
   "params": {
     "message": {
-      "messageId": "fad92440bd92be02b853c0abd901cbea",
+      "messageId": "14053994d284e4e8e7289527a7693f93",
       "contextId": "",
       "taskId": "",
       "role": "ROLE_USER",
@@ -19,12 +19,12 @@
         "action": {
           "v": 1,
           "handle": "avery@mazel",
-          "publicKey": "wYcor4fe1YNBl2OL_fvWHIM4I0Fv5ip7zWqAewmaTiM",
+          "publicKey": "fABqfI_0Dq7QNp-gRJgVkPup4huNWscLcGM4538Hq38",
           "cardUrl": "https://mazel.fixture.workers.dev/.well-known/agent-card.json",
           "rpc": "https://mazel.fixture.workers.dev/a2a",
-          "castAt": "2026-10-08T06:53:06.408Z",
+          "castAt": "2026-10-15T07:20:47.595Z",
           "type": "intro.propose",
-          "introId": "7b811cc11fd68bd23053ded8d0183c6b",
+          "introId": "b9ab48ef9a675028b7822bc69a0ca840",
           "why": "You need someone who has crossed the Atlantic by sailboat; peer@mazel has sailing-atlantic.",
           "needText": "someone who has crossed the Atlantic by sailboat",
           "needTags": [
@@ -46,9 +46,9 @@
             "cardUrl": "https://mazel.fixture.workers.dev/card",
             "rpc": "https://mazel.fixture.workers.dev/a2a"
           },
-          "contextId": "54a847d5fd5f3de22992e5913d9edc6e",
-          "sig": "Oev_c7ZYYr8pHh1G5Og80R4twQP3P39bycIChUzgHp8BnvGov7F7NJJ8_38lYHuqvbO2esEYY5oFcLveWIZfBQ",
-          "kid": "3GhXQcarb0GQGTnA"
+          "contextId": "8d0c05794fdf6fe9399fd1dc1ab473ae",
+          "sig": "CVgkbgIr52YCBqTr4leAW8JKeCcTKy_0hZEAL29SALDXZQAfUaagfJF_8eQyhwO054t_TTSqK5k1hTBPSHlHAg",
+          "kid": "CYc_i_sh8PkogMsv"
         }
       },
       "extensions": [

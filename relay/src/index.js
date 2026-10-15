@@ -17,7 +17,7 @@
 // GET  /.well-known/relay.json          this relay's public key
 // GET  /                the sentence above
 
-const RELAY_VERSION = "0.5.9";   // stamped by relay/build.mjs from the portal
+const RELAY_VERSION = "0.5.10";   // stamped by relay/build.mjs from the portal
 const HAAH_URI = "https://mazel.ai/ext/haah/v1";
 const CAST_TTL = 60 * 60 * 24 * 7;
 const DIR_TTL = 60 * 60 * 24 * 90;
