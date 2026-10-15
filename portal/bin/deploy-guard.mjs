@@ -32,7 +32,24 @@ const credentials = [
 
 const localLogin = credentials.some((p) => { try { return existsSync(p); } catch { return false; } });
 
-if (ci || !localLogin) process.exit(0);
+// The build log is the last thing a person reads after clicking the button, and it ends in upload
+// sizes and binding tables. So the one thing they have to do next goes in it, in their own words.
+// Printed only on the path the button takes; a developer running this locally is told something
+// else below.
+const openItNow = () => console.log(`
+  ----------------------------------------------------------------------
+   Open it now
+
+   1. Open your portal's address, the https://... .workers.dev link in
+      this log, in a browser.
+   2. Copy the link on that page and paste it into your AI as a connector.
+   3. Say "mazel." It asks one question and writes your card with you.
+
+   The link on that page works for the first 60 minutes.
+  ----------------------------------------------------------------------
+`);
+
+if (ci || !localLogin) { openItNow(); process.exit(0); }
 
 console.error(`
   This directory is the installer template, not an update path.

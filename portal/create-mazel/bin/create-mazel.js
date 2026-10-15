@@ -40,6 +40,13 @@ const YES = flag("yes"), DRY = flag("dry-run"), ROTATE = flag("rotate-key");
 // the only thing that changes where a portal keeps its state, and it is deliberately separate from
 // an ordinary update, because the copy and the verify come first (migrate_store).
 const STORE = opt("store", "");
+// Where this network's feedback door is. A deploy variable, never a literal in the worker: the
+// worker ships to everyone and nobody's address belongs in it. --feedback you@mazel, or
+// MAZEL_FEEDBACK_HANDLE. Left out, the portal has no feedback door and says so when asked.
+const FEEDBACK = opt("feedback", env.MAZEL_FEEDBACK_HANDLE || "");
+// Names this portal answers for besides its own: a project handle the directory's owner points
+// here, like the one the feedback door uses. --alias feedback@mazel, comma-separated for several.
+const ALIAS = opt("alias", env.MAZEL_ALIAS_HANDLES || "");
 const NAME = opt("name", "mazel");
 const DEFAULT_RELAY = "https://relay.mazel-peer.workers.dev";
 const RELAY = opt("relay", env.MAZEL_RELAY_URL || DEFAULT_RELAY);
@@ -226,11 +233,17 @@ async function main() {
   // the scheduled pulse know its own address, since a cron run has no request to read it from.
   bindings.push({ type: "plain_text", name: "RELAY_URL", text: RELAY });
   bindings.push({ type: "plain_text", name: "PORTAL_ORIGIN", text: url });
+  // --feedback default drops the setting, so the worker's own project default applies again; any
+  // other value binds it; left out, an update keeps whatever the portal already carries.
+  if (FEEDBACK && FEEDBACK !== "default") bindings.push({ type: "plain_text", name: "FEEDBACK_HANDLE", text: FEEDBACK });
+  if (ALIAS) bindings.push({ type: "plain_text", name: "ALIAS_HANDLES", text: ALIAS });
   let inboxToken = "";
   if (updating) {
     const settings = await cf(token, `/accounts/${acc}/workers/scripts/${NAME}/settings`).catch(() => ({ bindings: [] }));
     const mine = new Set(["MAILBOX", "RELAY_URL", "PORTAL_ORIGIN"]);
     if (STORE) mine.add("STORE");          // --store is the one thing that overrides what it carries
+    if (FEEDBACK) mine.add("FEEDBACK_HANDLE");   // set it again and it is replaced or dropped, not inherited
+    if (ALIAS) mine.add("ALIAS_HANDLES");
     for (const b of settings.bindings || []) {
       if (mine.has(b.name)) continue;
       if (ROTATE && b.name === "INBOX_TOKEN") continue;

@@ -14,6 +14,10 @@
   "durable_objects": { "bindings": [{ "name": "PORTAL", "class_name": "Portal" }] },
   "migrations": [{ "tag": "do-v1", "new_sqlite_classes": ["Portal"] }],
 
+  "//routes": "Both of these are Cloudflare defaults that it warns about when they are left unsaid, so they are said. workers.dev is how a portal is reachable at all, and it is the address the installer prints. Preview URLs are off: a portal is one person's mailbox, and a second address answering as the same Worker is one more place a link can leak from.",
+  "workers_dev": true,
+  "preview_urls": false,
+
   "triggers": { "crons": ["*/30 * * * *"] },
 
   "vars": { "RELAY_URL": "https://relay.mazel-peer.workers.dev", "STORE": "do" },

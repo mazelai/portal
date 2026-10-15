@@ -104,6 +104,7 @@ ok('and the class is declared on the SQLite backend, which the free plan allows'
 ok('and a new portal keeps its state in the object from the start', names.STORE === 'plain_text' &&
    (seen.deploy?.bindings || []).find(b => b.name === 'STORE')?.text === 'do', JSON.stringify((seen.deploy?.bindings || []).find(b => b.name === 'STORE')));
 ok('the mailbox namespace is still bound, because the published card lives there', names.MAILBOX === 'kv_namespace');
+ok('no feedback door is bound unless the network says where it is', !('FEEDBACK_HANDLE' in names), JSON.stringify(names.FEEDBACK_HANDLE || null));
 ok('it prints one connector line to paste into an AI', /\/mcp\?token=[a-f0-9]{64}/.test(first.out) && /Paste this into your AI/.test(first.out));
 ok('it says what to say next', /say "mazel"/.test(first.out));
 ok('it ends clean', first.code === 0, 'exit ' + first.code);
@@ -131,6 +132,21 @@ PORT = await freePort();
   ok('a portal already in the object stays in it across an update', m.STORE && m.STORE.type === 'inherit', JSON.stringify(m.STORE));
   // --store is the one thing that moves a portal, and it is a separate run from an ordinary update.
   existingBindings = [{ type: 'secret_text', name: 'INBOX_TOKEN' }];
+  // --feedback is how a network says where its own door is; it is never a literal in the worker.
+  scripts = [];
+  const fed = await run(undefined, ['--feedback', 'door@mazel']);
+  const fb = Object.fromEntries((seen.deploy?.bindings || []).map(b => [b.name, b]));
+  ok('--feedback binds the door as a deploy variable', fb.FEEDBACK_HANDLE?.text === 'door@mazel' && fed.code === 0, JSON.stringify(fb.FEEDBACK_HANDLE || null));
+  // And a portal pointed somewhere can be put back on the project default, which means binding
+  // nothing and letting the worker's own default apply.
+  scripts = [{ id: 'mazel' }];
+  existingBindings = [{ type: 'secret_text', name: 'INBOX_TOKEN' }, { type: 'plain_text', name: 'FEEDBACK_HANDLE' }];
+  await run(undefined, ['--feedback', 'default']);
+  const back = Object.fromEntries((seen.deploy?.bindings || []).map(b => [b.name, b]));
+  ok('--feedback default drops the setting so the project default applies', !back.FEEDBACK_HANDLE, JSON.stringify(back.FEEDBACK_HANDLE || null));
+  existingBindings = [{ type: 'secret_text', name: 'INBOX_TOKEN' }];
+  scripts = [];
+  scripts = [{ id: 'mazel' }];
   const moved = await run(undefined, ['--store', 'do']);
   const mv = Object.fromEntries((seen.deploy?.bindings || []).map(b => [b.name, b]));
   ok('--store do moves a portal on KV into the object, and says so', mv.STORE?.text === 'do' && /read and write its storage object/.test(moved.out), JSON.stringify(mv.STORE));

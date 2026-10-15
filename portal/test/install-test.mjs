@@ -23,7 +23,12 @@ const mcp = async (env, name, args, token) => {
 let page = await (await get(fresh, '/')).text();
 const link = (page.match(/https:\/\/\S+\/mcp\?token=[a-f0-9]+/) || [])[0];
 ok('an unclaimed portal serves the setup link on /', !!link, page.split('\n')[0]);
-ok('the page says what to do with it', /paste this into your AI/i.test(page));
+// The welcome page is three numbered steps and nothing else: what the box holds and why the key is
+// safe live on the install page, which is where somebody reads about Mazel rather than does one
+// thing (decided 2026-10-15).
+ok('the page says what to do with it, as three numbered steps', /1\. Copy this link/.test(page) && /2\. Paste it into your AI as a connector/.test(page) && /3\. Say "mazel\."/.test(page), page.split('\n').filter((l) => /^[0-9]\./.test(l.trim())).join(' | '));
+ok('and says how long the link lasts and what replaces it', /Do this within 60 minutes/.test(page) && /your AI gives you/.test(page));
+ok('and carries neither the box paragraph nor the security paragraph', !/arrive in your box/.test(page) && !/setup key, not your mailbox key/.test(page));
 ok('the page says the link expires and why', /stops the moment|60 minutes|more minute/i.test(page));
 const token = link ? link.split('token=')[1] : '';
 ok('the link it prints actually opens the portal', /"tools"|unclaimed/.test(await (await worker.fetch(new Request(`${O}/mcp?token=${token}`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list' }) }), fresh)).text()));
@@ -179,7 +184,18 @@ globalThis.fetch = realFetch;
   ok('the onboarding document tells the agent what the box is', /Four kinds of thing arrive in their box/.test(setup) && /check_mailbox is that box/.test(setup), setup.slice(0, 60));
   ok('and tells it never to describe a match a tool did not return (lock 12)', /never describe a match, a yes, or a message that a tool did not return/.test(setup));
   const welcome = await (await worker.fetch(new Request(O + '/'), brandNew)).text();
-  ok('the welcome page says what will arrive, in the person\'s words', /arrive in your box/.test(welcome) && /both said yes/.test(welcome));
+  ok('the welcome page gives the three steps and nothing more', /1\. Copy this link/.test(welcome) && /3\. Say "mazel\."/.test(welcome) && !/arrive in your box/.test(welcome), welcome.split('\n')[0]);
+  // One wording for the two click paths, said the same on the portal's own page and on the install
+  // page, so a person who reads both is not told two different things.
+  const CLAUDE = 'Customize, Connectors, Add custom connector, paste, then Always allow when asked.';
+  const CHATGPT = 'Settings, Apps, Advanced settings, Developer mode on, add a connector, paste.';
+  ok('the welcome page uses the one wording for Claude and ChatGPT', welcome.includes(CLAUDE) && welcome.includes(CHATGPT));
+  const fsq = await import('node:fs');
+  const siteq = new URL('../../site/', import.meta.url).pathname;
+  for (const f of ['install.html', 'install-squarespace.html']) {
+    const p = fsq.readFileSync(siteq + f, 'utf8').replace(/\s+/g, ' ');
+    ok(`${f} uses the same wording, word for word`, p.includes(CLAUDE) && p.includes(CHATGPT), f);
+  }
   ok('and asks for no notification permission', !/notification|ring my phone/i.test(welcome));
 }
 
@@ -190,7 +206,7 @@ globalThis.fetch = realFetch;
 {
   const listed = (await (await worker.fetch(new Request(`${O}/mcp?token=${freshReal}`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list' }) }), fresh)).json()).result.tools;
   const names = listed.map(t => t.name);
-  ok('nineteen tools are listed', names.length === 19, names.join(' '));
+  ok('twenty tools are listed', names.length === 20 && names.includes('tell'), names.join(' '));
   ok('the loop is on the list', ['my_card','update_card','find','propose_intro','respond_intro','check_mailbox','thread_list','thread_read','thread_send','thread_mark','inbox_link','list_intros'].every(n => names.includes(n)));
   ok('the four merged tools and more_tools are on it', ['contacts','tribe','cards','thread_manage','more_tools'].every(n => names.includes(n)));
   ok('the ChatGPT write path stays listed', names.includes('claim_link') && names.includes('respond_intro_link'));
